@@ -7,6 +7,7 @@ on:
       - '.m88-live-trigger'
       - '.m88-outrights-trigger'
       - '.m88-ai-trigger'
+      - '.mansion-fetch-trigger'
 
 permissions:
   contents: read
@@ -17,7 +18,7 @@ jobs:
   dispatch:
     runs-on: ubuntu-latest
     steps:
-      - name: Dispatch requested Runner7 M88 workflows
+      - name: Dispatch requested Runner7 workflows
         env:
           GH_TOKEN: ${{ github.token }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
@@ -37,4 +38,8 @@ jobs:
           if grep -qx '.m88-ai-trigger' <<<"$files"; then
             gh workflow run m88-live-ai-publish.yml --repo "$GITHUB_REPOSITORY" --ref main
             echo 'DISPATCHED=m88-live-ai-publish.yml'
+          fi
+          if grep -qx '.mansion-fetch-trigger' <<<"$files"; then
+            gh workflow run mansion-seriea-fetch.yml --repo "$GITHUB_REPOSITORY" --ref main
+            echo 'DISPATCHED=mansion-seriea-fetch.yml'
           fi
