@@ -1,0 +1,70 @@
+name: Bootstrap M88 Pipeline From Runner3
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/bootstrap-m88-from-runner3.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  bootstrap:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Copy current M88 capture core into Runner7
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p .github/workflows
+          BASE='https://raw.githubusercontent.com/louisalviss/runner-3/main'
+          curl -LfsS --retry 3 "$BASE/m88_full_odds.py" -o m88_full_odds.py
+          curl -LfsS --retry 3 "$BASE/render_m88_full.py" -o render_m88_full.py
+          curl -LfsS --retry 3 "$BASE/build_m88_ai_database.py" -o build_m88_ai_database.py
+          curl -LfsS --retry 3 "$BASE/.github/workflows/m88-live-publish.yml" -o .github/workflows/m88-live-publish.yml
+          curl -LfsS --retry 3 "$BASE/.github/workflows/m88-outrights-all-publish.yml" -o .github/workflows/m88-outrights-all-publish.yml
+
+          python3 - <<'PY'
+          from pathlib import Path
+
+          p=Path('.github/workflows/m88-live-publish.yml')
+          s=p.read_text(encoding='utf-8')
+          needle="      - 'render_m88_full.py'\n"
+          if "'.m88-live-trigger'" not in s:
+              if needle not in s: raise SystemExit('live workflow path anchor missing')
+              s=s.replace(needle, needle+"      - '.m88-live-trigger'\n", 1)
+          p.write_text(s,encoding='utf-8')
+
+          p=Path('.github/workflows/m88-outrights-all-publish.yml')
+          s=p.read_text(encoding='utf-8')
+          needle="      - '.github/workflows/m88-outrights-all-publish.yml'\n"
+          if "'.m88-outrights-trigger'" not in s:
+              if needle not in s: raise SystemExit('outright workflow path anchor missing')
+              s=s.replace(needle, needle+"      - '.m88-outrights-trigger'\n", 1)
+          p.write_text(s,encoding='utf-8')
+          PY
+
+          python3 -m py_compile m88_full_odds.py render_m88_full.py build_m88_ai_database.py build_m88_ai_shards.py
+
+      - name: Commit migrated core
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add m88_full_odds.py render_m88_full.py build_m88_ai_database.py \
+            .github/workflows/m88-live-publish.yml \
+            .github/workflows/m88-outrights-all-publish.yml
+          if git diff --cached --quiet; then
+            echo 'M88 core already current'
+          else
+            git commit -m 'Migrate M88 capture pipeline to runner-7'
+            git push origin HEAD:main
+          fi
