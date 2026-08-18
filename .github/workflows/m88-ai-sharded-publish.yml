@@ -2,8 +2,9 @@ name: Runner7 M88 AI Sharded Publisher
 
 on:
   workflow_dispatch:
+  # Fallback only. Normal rebuilds are dispatched by a successful M88 Live Publisher.
   schedule:
-    - cron: '*/5 * * * *'
+    - cron: '11-59/15 * * * *'
   push:
     branches: [main]
     paths:
@@ -15,8 +16,8 @@ permissions:
   contents: write
 
 concurrency:
-  group: runner7-m88-ai-sharded-publisher-v2
-  cancel-in-progress: true
+  group: runner7-m88-ai-sharded-publisher-v3
+  cancel-in-progress: false
 
 jobs:
   publish:
