@@ -1,0 +1,40 @@
+name: Runner7 PR Workflow Dispatcher
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    paths:
+      - '.m88-live-trigger'
+      - '.m88-outrights-trigger'
+      - '.m88-ai-trigger'
+
+permissions:
+  contents: read
+  actions: write
+  pull-requests: read
+
+jobs:
+  dispatch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Dispatch requested Runner7 M88 workflows
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          files=$(gh pr diff "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --name-only)
+          printf '%s\n' "$files"
+          if grep -qx '.m88-live-trigger' <<<"$files"; then
+            gh workflow run m88-live-publish.yml --repo "$GITHUB_REPOSITORY" --ref main
+            echo 'DISPATCHED=m88-live-publish.yml'
+          fi
+          if grep -qx '.m88-outrights-trigger' <<<"$files"; then
+            gh workflow run m88-outrights-all-publish.yml --repo "$GITHUB_REPOSITORY" --ref main
+            echo 'DISPATCHED=m88-outrights-all-publish.yml'
+          fi
+          if grep -qx '.m88-ai-trigger' <<<"$files"; then
+            gh workflow run m88-ai-sharded-publish.yml --repo "$GITHUB_REPOSITORY" --ref main
+            echo 'DISPATCHED=m88-ai-sharded-publish.yml'
+          fi
