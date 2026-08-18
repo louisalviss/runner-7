@@ -1,0 +1,142 @@
+name: Mansionbet Serie A Fetch
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - '.mansion-fetch-trigger'
+
+permissions:
+  contents: write
+
+jobs:
+  fetch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Fetch with runner IP
+        id: curlfetch
+        shell: bash
+        run: |
+          set -u
+          mkdir -p mansion-snapshots
+          TARGET='https://www.mansionbet.com/vn/serie-a/'
+          RUNNER_IP=$(curl -fsS --max-time 10 https://api.ipify.org || true)
+          printf '%s' "$RUNNER_IP" > mansion-snapshots/runner-ip.txt
+          CODE=$(curl -L --compressed --max-time 45 \
+            -A 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36' \
+            -H 'Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8' \
+            -H 'Accept-Language: vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7' \
+            -H 'Cache-Control: no-cache' \
+            -H 'Pragma: no-cache' \
+            -H 'Upgrade-Insecure-Requests: 1' \
+            -D mansion-snapshots/serie-a.headers.txt \
+            -o mansion-snapshots/serie-a.curl.html \
+            -w '%{http_code}' "$TARGET" || true)
+          printf '%s' "$CODE" > mansion-snapshots/curl-status.txt
+          SIZE=$(wc -c < mansion-snapshots/serie-a.curl.html 2>/dev/null || echo 0)
+          echo "code=$CODE" >> "$GITHUB_OUTPUT"
+          echo "size=$SIZE" >> "$GITHUB_OUTPUT"
+          echo "RUNNER_IP=$RUNNER_IP HTTP=$CODE BYTES=$SIZE"
+
+      - name: Decide browser fallback
+        id: decide
+        shell: bash
+        run: |
+          CODE='${{ steps.curlfetch.outputs.code }}'
+          SIZE='${{ steps.curlfetch.outputs.size }}'
+          NEED=0
+          if [ "$CODE" != '200' ] || [ "${SIZE:-0}" -lt 10000 ]; then NEED=1; fi
+          if grep -Eqi 'access denied|captcha|cloudflare|forbidden|checking your browser|just a moment' mansion-snapshots/serie-a.curl.html 2>/dev/null; then NEED=1; fi
+          echo "need=$NEED" >> "$GITHUB_OUTPUT"
+
+      - name: Install Playwright
+        if: steps.decide.outputs.need == '1'
+        shell: bash
+        run: |
+          npm init -y >/dev/null 2>&1
+          npm install playwright@1.55.0 >/dev/null 2>&1
+          npx playwright install --with-deps chromium
+
+      - name: Fetch with Chromium
+        if: steps.decide.outputs.need == '1'
+        shell: bash
+        run: |
+          cat > /tmp/fetch-mansion.js <<'JS'
+          const { chromium } = require('playwright');
+          const fs = require('fs');
+          (async () => {
+            const browser = await chromium.launch({headless:true});
+            const context = await browser.newContext({
+              locale: 'vi-VN',
+              timezoneId: 'Asia/Ho_Chi_Minh',
+              userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36',
+              viewport: {width: 1440, height: 1200}
+            });
+            const page = await context.newPage();
+            let status = 0;
+            try {
+              const r = await page.goto('https://www.mansionbet.com/vn/serie-a/', {waitUntil:'domcontentloaded', timeout:60000});
+              status = r ? r.status() : 0;
+              await page.waitForTimeout(8000);
+              const html = await page.content();
+              fs.writeFileSync('mansion-snapshots/serie-a.browser.html', html);
+              fs.writeFileSync('mansion-snapshots/browser-title.txt', await page.title());
+              fs.writeFileSync('mansion-snapshots/browser-url.txt', page.url());
+              fs.writeFileSync('mansion-snapshots/browser-status.txt', String(status));
+              await page.screenshot({path:'mansion-snapshots/serie-a.png', fullPage:true});
+              console.log(`BROWSER_STATUS=${status} BYTES=${Buffer.byteLength(html)} TITLE=${await page.title()} URL=${page.url()}`);
+            } catch (e) {
+              fs.writeFileSync('mansion-snapshots/browser-error.txt', String(e && e.stack || e));
+              console.error(e);
+            }
+            await browser.close();
+          })();
+          JS
+          node /tmp/fetch-mansion.js
+
+      - name: Build metadata
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json, os, datetime
+          p='mansion-snapshots'
+          def read(name):
+              try:
+                  return open(os.path.join(p,name),encoding='utf-8',errors='replace').read().strip()
+              except Exception:
+                  return None
+          def size(name):
+              try: return os.path.getsize(os.path.join(p,name))
+              except Exception: return 0
+          meta={
+            'captured_at': datetime.datetime.now(datetime.timezone.utc).isoformat(),
+            'target':'https://www.mansionbet.com/vn/serie-a/',
+            'runner_ip':read('runner-ip.txt'),
+            'curl_status':read('curl-status.txt'),
+            'curl_bytes':size('serie-a.curl.html'),
+            'browser_status':read('browser-status.txt'),
+            'browser_bytes':size('serie-a.browser.html'),
+            'browser_title':read('browser-title.txt'),
+            'browser_url':read('browser-url.txt'),
+            'browser_error':read('browser-error.txt'),
+          }
+          open(os.path.join(p,'meta.json'),'w',encoding='utf-8').write(json.dumps(meta,ensure_ascii=False,indent=2))
+          print(json.dumps(meta,ensure_ascii=False,indent=2))
+          PY
+
+      - name: Publish snapshot
+        shell: bash
+        run: |
+          git config user.name 'runner-7-bot'
+          git config user.email 'runner-7-bot@users.noreply.github.com'
+          git add mansion-snapshots
+          if git diff --cached --quiet; then
+            echo 'No snapshot changes'
+            exit 0
+          fi
+          git commit -m 'chore: refresh Mansionbet Serie A snapshot'
+          git push
