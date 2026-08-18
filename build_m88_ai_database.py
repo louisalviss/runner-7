@@ -37,7 +37,7 @@ def main():
     now = datetime.now(timezone.utc)
     vn = timezone(timedelta(hours=7))
 
-    match_ts = matches.get("generated_at") or matches.get("live_generated_at")
+    match_ts = matches.get("generated_at") or matches.get("live_generated_at") or matches.get("captured_at")
     out_ts = outs.get("captured_at_utc")
     match_age = age_seconds(now, match_ts)
     out_age = age_seconds(now, out_ts)
@@ -45,8 +45,8 @@ def main():
     match_list = matches.get("matches") or []
     out_list = outs.get("markets") or []
     out_failures = outs.get("failures") or []
-    source_text = " ".join(str(matches.get(k, "")) for k in ("source", "source_mode"))
-    exact_match = ("m88" in source_text.lower()) and len(match_list) >= 50
+    source_text = " ".join(str(matches.get(k, "")) for k in ("source", "source_mode", "source_provider", "source_provenance"))
+    exact_match = matches.get("exact_operator_odds") is True and "m88" in source_text.lower() and len(match_list) >= 50
     exact_out = outs.get("exact_operator_odds") is True and len(out_list) >= 40
     ratio = float((outs.get("coverage") or {}).get("capture_ratio") or 0)
 
@@ -86,7 +86,7 @@ def main():
             "reason": failure.get("reason"),
         })
 
-    match_status = "fresh" if match_age is not None and match_age <= 600 else "stale"
+    match_status = "fresh" if match_age is not None and match_age <= 1200 else "stale"
     if ratio >= 0.90 and out_age is not None and out_age <= 2700:
         out_status = "fresh"
     elif ratio >= 0.75:
@@ -109,7 +109,7 @@ def main():
                 "captured_at": match_ts,
                 "age_seconds": match_age,
                 "target_refresh_seconds": 300,
-                "stale_after_seconds": 600,
+                "stale_after_seconds": 1200,
                 "source": "direct M88/MSports guest feed",
             },
             "outrights": {
