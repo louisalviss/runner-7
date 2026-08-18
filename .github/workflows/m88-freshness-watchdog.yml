@@ -1,0 +1,81 @@
+name: Runner7 M88 Freshness Watchdog
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Offset from the primary :02/:07/:12... publisher schedule.
+    - cron: '4-59/5 * * * *'
+
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: runner7-m88-freshness-watchdog-v1
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    steps:
+      - name: Check Match Odds freshness and recover missed cadence
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          URL="https://raw.githubusercontent.com/${REPO}/m88-ai-data/matches/index.json"
+          tmp=$(mktemp)
+
+          if ! curl -fsS --connect-timeout 8 --max-time 15 \
+            -H 'Cache-Control: no-cache' \
+            "${URL}?ts=$(date +%s)" -o "$tmp"; then
+            echo "WATCHDOG=INDEX_FETCH_FAILED"
+            exit 0
+          fi
+
+          age=$(python3 - "$tmp" <<'PY'
+          import json,sys
+          from datetime import datetime, timezone
+
+          d=json.load(open(sys.argv[1]))
+          ts=d.get("source_captured_at") or ((d.get("freshness") or {}).get("captured_at"))
+          if not ts:
+              print(999999)
+              raise SystemExit
+          dt=datetime.fromisoformat(str(ts).replace("Z","+00:00"))
+          if dt.tzinfo is None:
+              dt=dt.replace(tzinfo=timezone.utc)
+          print(max(0,int((datetime.now(timezone.utc)-dt.astimezone(timezone.utc)).total_seconds())))
+          PY
+          )
+
+          echo "MATCH_AGE_SECONDS=$age"
+
+          # Primary target is 300s. Allow 120s scheduling/runtime slack.
+          if [ "$age" -le 420 ]; then
+            echo "WATCHDOG=FRESH"
+            exit 0
+          fi
+
+          # Do not pile another run on top of an already queued/running publisher.
+          active=$(
+            gh run list \
+              --repo "$REPO" \
+              --workflow m88-live-ai-publish.yml \
+              --limit 20 \
+              --json status \
+              --jq '[.[] | select(.status=="queued" or .status=="in_progress" or .status=="waiting" or .status=="pending")] | length'
+          )
+          echo "ACTIVE_PUBLISH_RUNS=$active"
+
+          if [ "$active" -gt 0 ]; then
+            echo "WATCHDOG=STALE_BUT_PUBLISH_ACTIVE"
+            exit 0
+          fi
+
+          echo "WATCHDOG=TRIGGER_REFRESH"
+          gh workflow run m88-live-ai-publish.yml --repo "$REPO"
