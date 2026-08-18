@@ -24,6 +24,33 @@ def age_seconds(now, value):
     return None if dt is None else max(0, int((now - dt).total_seconds()))
 
 
+def iso_plus_seconds(value, seconds):
+    dt = parse_dt(value)
+    if dt is None:
+        return None
+    return (dt + timedelta(seconds=seconds)).isoformat().replace("+00:00", "Z")
+
+
+def freshness_entry(*, now, captured_at, target_refresh_seconds, stale_after_seconds, source, status, **extra):
+    age = age_seconds(now, captured_at)
+    entry = {
+        "status": status,
+        "status_at_build": status,
+        "captured_at": captured_at,
+        "age_seconds": age,
+        "age_seconds_semantics": "deprecated_build_time_only",
+        "age_at_build_seconds": age,
+        "target_refresh_seconds": target_refresh_seconds,
+        "target_refresh_at": iso_plus_seconds(captured_at, target_refresh_seconds),
+        "stale_after_seconds": stale_after_seconds,
+        "stale_after_at": iso_plus_seconds(captured_at, stale_after_seconds),
+        "consumer_rule": "Recompute current age as now_utc - captured_at. Do not treat age_at_build_seconds or status_at_build as live values.",
+        "source": source,
+    }
+    entry.update(extra)
+    return entry
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--matches", required=True)
@@ -94,6 +121,24 @@ def main():
     else:
         out_status = "stale"
 
+    match_freshness = freshness_entry(
+        now=now,
+        captured_at=match_ts,
+        target_refresh_seconds=300,
+        stale_after_seconds=1200,
+        source="direct M88/MSports guest feed",
+        status=match_status,
+    )
+    outright_freshness = freshness_entry(
+        now=now,
+        captured_at=out_ts,
+        target_refresh_seconds=900,
+        stale_after_seconds=2700,
+        source="native M88 -> SABA Outright board",
+        status=out_status,
+        capture_ratio=ratio,
+    )
+
     db = {
         "schema_version": 3,
         "operator": "M88",
@@ -103,31 +148,17 @@ def main():
         "generated_at_utc": now.isoformat().replace("+00:00", "Z"),
         "generated_at_vn": now.astimezone(vn).isoformat(),
         "status": "fresh" if match_status == "fresh" and out_status == "fresh" else "degraded",
+        "status_at_build": "fresh" if match_status == "fresh" and out_status == "fresh" else "degraded",
         "freshness": {
-            "match_odds": {
-                "status": match_status,
-                "captured_at": match_ts,
-                "age_seconds": match_age,
-                "target_refresh_seconds": 300,
-                "stale_after_seconds": 1200,
-                "source": "direct M88/MSports guest feed",
-            },
-            "outrights": {
-                "status": out_status,
-                "captured_at": out_ts,
-                "age_seconds": out_age,
-                "target_refresh_seconds": 900,
-                "stale_after_seconds": 2700,
-                "source": "native M88 -> SABA Outright board",
-                "capture_ratio": ratio,
-            },
+            "match_odds": match_freshness,
+            "outrights": outright_freshness,
         },
         "ai_usage": {
             "primary_instruction": "Use this file as the canonical current M88 odds database. Never substitute another bookmaker for an M88 price.",
             "article_refresh": "Identify the article competition/season and requested market. Search index.outright_titles then datasets.outrights.markets. For match odds search datasets.match_odds.matches by league, home, away and scope.",
-            "absence_rule": "Before saying an Outright market is not listed, search both datasets.outrights.markets and datasets.outrights.failures (or index.outright_failures). A market appearing in failures was discovered on M88 but its price capture failed; report it as capture_failed/temporarily unavailable, never as not listed. Only state not currently listed when freshness.outrights.status is fresh, capture_ratio is at least 0.90, and no matching title/market appears in either markets or failures.",
+            "absence_rule": "Before saying an Outright market is not listed, search both datasets.outrights.markets and datasets.outrights.failures (or index.outright_failures). A market appearing in failures was discovered on M88 but its price capture failed; report it as capture_failed/temporarily unavailable, never as not listed. Only state not currently listed when the current age computed from freshness.outrights.captured_at is within stale_after_seconds, capture_ratio is at least 0.90, and no matching title/market appears in either markets or failures.",
             "failure_rule": "If a requested Outright market appears in datasets.outrights.failures, preserve its title/market_id/reason and say the current M88 board exposed the market but this snapshot did not capture its prices. Do not reuse old odds and do not substitute another bookmaker.",
-            "freshness_rule": "Always inspect freshness before quoting odds. If the relevant dataset is stale, disclose that instead of presenting it as current.",
+            "freshness_rule": "Always recompute current age as now_utc - freshness.<dataset>.captured_at. age_seconds, age_at_build_seconds, status and status_at_build are build-time diagnostics only. If current age exceeds stale_after_seconds, disclose that the dataset is stale instead of presenting it as current.",
             "preserve_structure_rule": "When refreshing an existing article, preserve valid structure and wording unless explicitly asked to rewrite; replace outdated facts and odds only.",
         },
         "index": {
@@ -152,6 +183,7 @@ def main():
             "generated_at_utc": db["generated_at_utc"],
             "generated_at_vn": db["generated_at_vn"],
             "status": db["status"],
+            "status_at_build": db["status_at_build"],
             "freshness": db["freshness"],
             "index": {
                 "match_scopes": scopes,
@@ -163,7 +195,7 @@ def main():
             },
         }
         Path(args.health).write_text(json.dumps(health, ensure_ascii=False, indent=2), encoding="utf-8")
-    print(json.dumps({"status": db["status"], "freshness": db["freshness"], "match_count": len(match_list), "outright_market_count": len(out_list), "outright_failed_market_count": len(out_failures)}, ensure_ascii=False))
+    print(json.dumps({"status": db["status"], "status_at_build": db["status_at_build"], "freshness": db["freshness"], "match_count": len(match_list), "outright_market_count": len(out_list), "outright_failed_market_count": len(out_failures)}, ensure_ascii=False))
 
 
 if __name__ == "__main__":
