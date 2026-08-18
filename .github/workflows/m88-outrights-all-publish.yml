@@ -8,13 +8,14 @@ on:
     branches: [main]
     paths:
       - '.github/workflows/m88-outrights-all-publish.yml'
+      - 'm88_outrights_capture.py'
 
 permissions:
   contents: write
 
 concurrency:
-  group: m88-outrights-all-publisher
-  cancel-in-progress: true
+  group: m88-outrights-all-publisher-v2
+  cancel-in-progress: false
 
 jobs:
   collect:
@@ -24,10 +25,13 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install collector dependencies
+        shell: bash
         run: |
           set -euo pipefail
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq openvpn iproute2 iptables curl jq
+          if ! command -v openvpn >/dev/null 2>&1; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq openvpn iproute2 iptables curl jq
+          fi
           python3 -m pip install -q 'playwright>=1.46,<2'
           mkdir -p evidence /tmp/relays
 
@@ -51,7 +55,10 @@ jobs:
                   p=pathlib.Path(f'/tmp/relays/{len(meta):02d}-{c}.ovpn')
                   p.write_text(cfg)
                   meta.append(f'{p}\t{c}\t{r.get("IP","")}')
+          if not meta:
+              raise SystemExit('No Asia VPN Gate relays')
           pathlib.Path('/tmp/relays.tsv').write_text('\n'.join(meta)+'\n')
+          print('RELAYS='+str(len(meta)))
           PY
 
           IFACE=$(ip route show default|awk '{print $5;exit}')
@@ -102,212 +109,20 @@ jobs:
           done </tmp/relays.tsv
           test "$selected" = 1
 
-      - name: Capture every M88 SABA Outright market
+      - name: Capture exact M88 SABA Outright board
         shell: bash
         run: |
-          sudo ip netns exec vpnns runuser -u runner -- env HOME=/home/runner WORKSPACE="$GITHUB_WORKSPACE" python3 - <<'PY'
-          import json,os,re,time
-          from datetime import datetime,timezone,timedelta
-          from pathlib import Path
-          from urllib.parse import urlparse
-          from playwright.sync_api import sync_playwright
-
-          OUT=Path(os.environ['WORKSPACE'])/'evidence'
-          showall=[]; getmarkets=[]
-
-          def pframe(page):
-              xs=[f for f in page.frames if urlparse(f.url).netloc.startswith('i1x9gr.')]
-              return xs[-1] if xs else None
-
-          def parse_post(s):
-              if not s:return {}
-              try:return json.loads(s)
-              except Exception:pass
-              try:
-                  from urllib.parse import parse_qs
-                  return {k:v[-1] for k,v in parse_qs(s).items()}
-              except Exception:return {}
-
-          def scroll_all(frame,pct):
-              try:
-                  frame.evaluate('''pct => {
-                    const frac=Math.max(0,Math.min(1,pct/100));
-                    const root=document.scrollingElement||document.documentElement;
-                    if(root) root.scrollTop=(root.scrollHeight-root.clientHeight)*frac;
-                    for(const e of document.querySelectorAll('*')){
-                      const cs=getComputedStyle(e);
-                      if((cs.overflowY==='auto'||cs.overflowY==='scroll') && e.scrollHeight>e.clientHeight+180){
-                        e.scrollTop=(e.scrollHeight-e.clientHeight)*frac;
-                      }
-                    }
-                  }''',pct)
-              except Exception:pass
-
-          def visible_title(frame,title):
-              loc=frame.get_by_text(title,exact=True)
-              for i in range(min(loc.count(),30)):
-                  try:
-                      if loc.nth(i).is_visible(): return loc.nth(i)
-                  except Exception:pass
-              return None
-
-          def title_meta(title):
-              clean=title.strip().lstrip('*').strip()
-              season=None
-              m=re.search(r'\b(20\d{2}/20\d{2})\b',clean)
-              if m:season=m.group(1)
-              competition=None; market_name=None
-              if ' - ' in clean:
-                  left,right=clean.rsplit(' - ',1)
-                  market_name=right.strip()
-                  competition=re.sub(r'\s*20\d{2}/20\d{2}\s*',' ',left).strip()
-              return {'competition_guess':competition,'season_guess':season,'market_name_guess':market_name}
-
-          with sync_playwright() as p:
-              b=p.chromium.launch(channel='chrome',headless=True,args=['--no-sandbox','--disable-dev-shm-usage'])
-              c=b.new_context(viewport={'width':390,'height':844},screen={'width':390,'height':844},device_scale_factor=3,is_mobile=True,has_touch=True,locale='en-US',timezone_id='Asia/Bangkok',user_agent='Mozilla/5.0 (iPhone; CPU iPhone OS 26_4 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/26.0 Mobile/15E148 Safari/604.1')
-              page=c.new_page()
-
-              def onresp(r):
-                  try:
-                      if 'BFOdds/ShowAllOdds' in r.url:
-                          showall.append(json.loads(r.text()))
-                      elif 'BFOdds/GetMarket' in r.url:
-                          getmarkets.append({'post':r.request.post_data or '','body':r.text(),'url':r.url})
-                  except Exception:pass
-              page.on('response',onresp)
-
-              page.goto('https://www.m88.com/sports/Saba%20Sports?Language=en-US',wait_until='domcontentloaded',timeout=45000)
-              page.wait_for_timeout(22000)
-              f=pframe(page)
-              if not f:raise RuntimeError('No SABA frame')
-
-              sports=f.get_by_text('Sports',exact=True)
-              for i in range(min(sports.count(),20)):
-                  try:
-                      if sports.nth(i).is_visible():sports.nth(i).click(timeout=5000);break
-                  except Exception:pass
-              page.wait_for_timeout(8000); f=pframe(page) or f
-
-              out=f.get_by_text(re.compile(r'^\s*Outright(?:\s+\d+)?\s*$',re.I)).nth(0)
-              out.evaluate("e=>e.scrollIntoView({block:'nearest',inline:'center'})")
-              page.wait_for_timeout(500)
-              out.evaluate('e=>e.parentElement.click()')
-              page.wait_for_timeout(9000); f=pframe(page) or f
-              route=f.url
-
-              for pct in range(0,101,10):
-                  scroll_all(f,pct); page.wait_for_timeout(350)
-              scroll_all(f,0); page.wait_for_timeout(800)
-
-              leagueN={}; teamN={}
-              for obj in showall:
-                  d=(obj or {}).get('Data') or {}
-                  for k,v in (d.get('LeagueN') or {}).items(): leagueN[str(k)]=v
-                  for k,v in (d.get('TeamN') or {}).items(): teamN[str(k)]=v
-              targets=[]
-              for k,title in leagueN.items():
-                  if str(k).isdigit() and isinstance(title,str) and title.strip():
-                      targets.append((int(k),title.strip()))
-              targets.sort(key=lambda x:x[0])
-              if len(targets)<40:
-                  raise RuntimeError(f'Unsafe Outright discovery count={len(targets)} showall={len(showall)}')
-
-              markets=[]; failures=[]; unresolved=0
-              for idx,(mid,title) in enumerate(targets,1):
-                  el=visible_title(f,title)
-                  if el is None:
-                      for pct in range(0,101,10):
-                          scroll_all(f,pct); page.wait_for_timeout(120)
-                          el=visible_title(f,title)
-                          if el is not None:break
-                  if el is None:
-                      failures.append({'market_id':mid,'title':title,'reason':'title_not_in_dom'})
-                      continue
-                  try:
-                      el.scroll_into_view_if_needed(timeout=3500); page.wait_for_timeout(100)
-                  except Exception:pass
-
-                  captured=None
-                  for click_attempt in range(2):
-                      before=len(getmarkets)
-                      try:el.click(timeout=4500)
-                      except Exception:
-                          try:el.evaluate('e=>e.click()')
-                          except Exception:pass
-                      deadline=time.time()+4.5
-                      while time.time()<deadline and captured is None:
-                          for x in getmarkets[before:]:
-                              po=parse_post(x['post'])
-                              try:got=int(po.get('Matchid',-1))
-                              except Exception:got=-1
-                              if got==mid:
-                                  captured=x;break
-                          if captured is None:page.wait_for_timeout(120)
-                      if captured is not None:break
-                  if captured is None:
-                      failures.append({'market_id':mid,'title':title,'reason':'no_native_getmarket'})
-                      continue
-                  try:obj=json.loads(captured['body'])
-                  except Exception:
-                      failures.append({'market_id':mid,'title':title,'reason':'non_json_getmarket'});continue
-                  data=(obj or {}).get('Data') or {}
-                  for k,v in (data.get('TeamN') or {}).items(): teamN[str(k)]=v
-                  odds=data.get('NewOdds') or []
-                  selections=[]
-                  for o in odds:
-                      tid=o.get('TeamId'); price=o.get('Price')
-                      if price is None:continue
-                      name=teamN.get(str(tid))
-                      if not name:
-                          name=f'ID:{tid}'; unresolved+=1
-                      selections.append({'name':name,'odds':price,'team_id':tid,'market_id':o.get('MarketId')})
-                  if not selections:
-                      failures.append({'market_id':mid,'title':title,'reason':'empty_selections'});continue
-                  markets.append({'market_id':mid,'title':title,'normalized_title':re.sub(r'\s+',' ',title).strip().casefold(),**title_meta(title),'selections':selections})
-                  if idx%10==0:print(f'CAPTURE_PROGRESS {idx}/{len(targets)} ok={len(markets)} fail={len(failures)}')
-                  try:el.click(timeout=1200);page.wait_for_timeout(60)
-                  except Exception:pass
-
-              now=datetime.now(timezone.utc); vn=timezone(timedelta(hours=7))
-              coverage=(len(markets)/len(targets)) if targets else 0
-              result={
-                'schema_version':2,
-                'operator':'M88',
-                'provider':'SABA Sports',
-                'exact_operator_odds':True,
-                'sport':'soccer',
-                'dataset':'all_outrights',
-                'source_kind':'public_guest_board_native_capture',
-                'source_url':'https://www.m88.com/sports/Saba%20Sports?Language=en-US',
-                'provider_route':route,
-                'captured_at_utc':now.isoformat().replace('+00:00','Z'),
-                'captured_at_vn':now.astimezone(vn).isoformat(),
-                'refresh_target_minutes':15,
-                'status':'fresh' if coverage>=0.90 else 'partial',
-                'coverage':{
-                  'showall_responses':len(showall),
-                  'discovered_markets':len(targets),
-                  'captured_markets':len(markets),
-                  'failed_markets':len(failures),
-                  'capture_ratio':round(coverage,4),
-                  'unresolved_selection_names':unresolved
-                },
-                'usage':{
-                  'instruction':'Search title/normalized_title/competition_guess. Use only these M88 odds. A market may be declared not listed only when this snapshot is fresh and coverage is high. Never substitute another bookmaker.',
-                  'not_listed_requires_capture_ratio':0.90,
-                  'stale_after_minutes':45
-                },
-                'markets':markets,
-                'failures':failures
-              }
-              if coverage<0.75:
-                  raise RuntimeError(f'Unsafe capture coverage {coverage:.1%}: {len(markets)}/{len(targets)}')
-              (OUT/'m88-outrights-all.json').write_text(json.dumps(result,ensure_ascii=False,separators=(',',':')),encoding='utf-8')
-              (OUT/'m88-outrights-health.json').write_text(json.dumps({k:result[k] for k in ['captured_at_utc','captured_at_vn','status','coverage']},ensure_ascii=False,indent=2),encoding='utf-8')
-              page.screenshot(path=str(OUT/'outrights-final.png'),full_page=False)
-              print(json.dumps(result['coverage'],ensure_ascii=False))
-              c.close();b.close()
+          set -euo pipefail
+          sudo ip netns exec vpnns runuser -u runner -- env HOME=/home/runner WORKSPACE="$GITHUB_WORKSPACE" python3 "$GITHUB_WORKSPACE/m88_outrights_capture.py"
+          test -s evidence/m88-outrights-all.json
+          python3 - <<'PY'
+          import json
+          d=json.load(open('evidence/m88-outrights-all.json'))
+          c=d.get('coverage') or {}
+          ratio=float(c.get('capture_ratio') or 0)
+          print('OUTRIGHT_COVERAGE',json.dumps(c,ensure_ascii=False))
+          if ratio < .90:
+              raise SystemExit(f'Production safety gate: {ratio:.2%} < 90%')
           PY
 
       - name: Publish last-good full Outright snapshot
@@ -316,11 +131,13 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          test -s evidence/m88-outrights-all.json
           if ! gh release view m88-outrights-all --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            gh release create m88-outrights-all --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --title 'M88 All Outrights' --notes 'Exact M88/SABA full-board Outright snapshot, refreshed automatically.'
+            gh release create m88-outrights-all --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --title 'M88 All Outrights' --notes 'Exact M88/SABA full-board Outright snapshot, refreshed automatically on Runner7.'
           fi
-          gh release upload m88-outrights-all --repo "$GITHUB_REPOSITORY" evidence/m88-outrights-all.json#M88-outrights-all.json evidence/m88-outrights-health.json#M88-outrights-health.json --clobber
+          gh release upload m88-outrights-all --repo "$GITHUB_REPOSITORY" \
+            evidence/m88-outrights-all.json#M88-outrights-all.json \
+            evidence/m88-outrights-health.json#M88-outrights-health.json \
+            --clobber
 
       - uses: actions/upload-artifact@v4
         if: always()
