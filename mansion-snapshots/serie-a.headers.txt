@@ -1,0 +1,23 @@
+HTTP/2 200 
+server: istio-envoy
+x-middleware-rewrite: /vn/api/amp/serie-a/
+x-envoy-upstream-service-time: 2645
+content-type: text/html
+content-encoding: br
+via: 1.1 varnish, 1.1 varnish
+accept-ranges: bytes
+age: 0
+date: Tue, 18 Aug 2026 07:53:08 GMT
+x-served-by: cache-iad-kiad7000021-IAD, cache-iad-kiad7000138-IAD, cache-icn1450042-ICN
+x-cache: MISS, HIT, MISS
+x-cache-hits: 0, 1, 0
+x-timer: S1787039588.313040,VS0,VE180
+vary: rsc, next-router-state-tree, next-router-prefetch, next-router-segment-prefetch, Accept-Encoding
+strict-transport-security: max-age=31557600
+x-origin: vulcank8
+x-vcl-version: 93
+surrogate-key: www.mansionbet.com
+cache-control: no-store, private
+alt-svc: h3=":443";ma=86400,h3-29=":443";ma=86400,h3-27=":443";ma=86400
+content-length: 21355
+
