@@ -23,6 +23,7 @@ jobs:
           set -euo pipefail
           sudo apt-get update -qq
           sudo apt-get install -y -qq openvpn iproute2 iptables curl
+          command -v google-chrome || command -v chromium || command -v chromium-browser || true
 
       - name: Build Asia relay pool
         shell: bash
@@ -40,7 +41,7 @@ jobs:
           for c in pref:
               rs=[r for r in rows if (r.get('CountryShort') or '').upper()==c and (r.get('OpenVPN_ConfigData_Base64') or '').strip()]
               rs.sort(key=lambda r:int(r.get('Speed') or 0),reverse=True)
-              picked.extend((c,r) for r in rs[:4])
+              picked.extend((c,r) for r in rs[:3])
           if not picked: raise SystemExit('No Asia VPN Gate relay')
           meta=[]
           for i,(c,r) in enumerate(picked):
@@ -53,11 +54,12 @@ jobs:
           print('RELAYS='+str(len(meta)))
           PY
 
-      - name: Rotate IP until Mansionbet opens
+      - name: Rotate IP and use real Chrome fingerprint
         shell: bash
         run: |
           set -euo pipefail
           TARGET='https://www.mansionbet.com/vn/serie-a/'
+          CHROME=$(command -v google-chrome || command -v chromium || command -v chromium-browser || true)
           IFACE=$(ip route show default | awk '{print $5; exit}')
           sudo ip netns add vpnns
           sudo ip link add vh type veth peer name vn
@@ -80,36 +82,58 @@ jobs:
             echo "TRY $country $relay"
             sudo ip netns exec vpnns pkill openvpn 2>/dev/null || true
             sleep 1
-            sudo rm -f /tmp/openvpn.log /tmp/mansion.html /tmp/mansion.headers
+            sudo rm -rf /tmp/chrome-profile
+            sudo rm -f /tmp/openvpn.log /tmp/mansion.curl.html /tmp/mansion.browser.html /tmp/chrome.log
             sudo touch /tmp/openvpn.log && sudo chmod 644 /tmp/openvpn.log
             sudo ip netns exec vpnns openvpn --config "$cfg" --daemon --log /tmp/openvpn.log || true
             ok=0
-            for i in {1..14}; do
+            for i in {1..12}; do
               sleep 1
               grep -q 'Initialization Sequence Completed' /tmp/openvpn.log 2>/dev/null && { ok=1; break; }
               grep -Eq 'AUTH_FAILED|TLS Error|Connection timed out|Connection refused|fatal error' /tmp/openvpn.log 2>/dev/null && break || true
             done
             if [ "$ok" != 1 ]; then
-              printf '%s\t%s\tVPN_FAIL\t0\n' "$country" "$relay" >> mansion-snapshots/attempts.tsv
+              printf '%s\t%s\tVPN_FAIL\t0\t0\n' "$country" "$relay" >> mansion-snapshots/attempts.tsv
               continue
             fi
             exitip=$(sudo ip netns exec vpnns curl -fsS --connect-timeout 6 --max-time 10 https://api.ipify.org || true)
-            code=$(sudo ip netns exec vpnns curl -L --compressed --connect-timeout 10 --max-time 40 \
+            code=$(sudo ip netns exec vpnns curl -L --compressed --connect-timeout 8 --max-time 25 \
               -A 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36' \
-              -H 'Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8' \
               -H 'Accept-Language: vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7' \
-              -H 'Cache-Control: no-cache' -H 'Pragma: no-cache' \
-              -D /tmp/mansion.headers -o /tmp/mansion.html -w '%{http_code}' "$TARGET" || true)
-            bytes=$(wc -c < /tmp/mansion.html 2>/dev/null || echo 0)
-            printf '%s\t%s\t%s\t%s\t%s\n' "$country" "$relay" "$exitip" "$code" "$bytes" >> mansion-snapshots/attempts.tsv
-            echo "RESULT country=$country relay=$relay exit_ip=$exitip http=$code bytes=$bytes"
-            if [ "$code" = '200' ] && [ "$bytes" -ge 10000 ] && ! grep -Eqi 'access denied|forbidden|checking your browser|just a moment|captcha' /tmp/mansion.html; then
-              cp /tmp/mansion.html mansion-snapshots/serie-a.html
-              cp /tmp/mansion.headers mansion-snapshots/serie-a.headers.txt
+              -o /tmp/mansion.curl.html -w '%{http_code}' "$TARGET" || true)
+            curlbytes=$(wc -c < /tmp/mansion.curl.html 2>/dev/null || echo 0)
+            browserbytes=0
+            if [ -n "$CHROME" ]; then
+              sudo ip netns exec vpnns timeout 55 "$CHROME" \
+                --headless=new --no-sandbox --disable-dev-shm-usage --disable-gpu \
+                --lang=vi-VN --window-size=1440,1800 --virtual-time-budget=10000 \
+                --user-data-dir=/tmp/chrome-profile --dump-dom "$TARGET" \
+                > /tmp/mansion.browser.html 2>/tmp/chrome.log || true
+              browserbytes=$(wc -c < /tmp/mansion.browser.html 2>/dev/null || echo 0)
+            fi
+            printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$country" "$relay" "$exitip" "$code" "$curlbytes" "$browserbytes" >> mansion-snapshots/attempts.tsv
+            echo "RESULT country=$country relay=$relay exit_ip=$exitip curl_http=$code curl_bytes=$curlbytes browser_bytes=$browserbytes"
+            if [ "$browserbytes" -ge 10000 ] \
+              && ! grep -Eqi 'access denied|forbidden|checking your browser|just a moment|captcha|ERR_[A-Z_]+' /tmp/mansion.browser.html \
+              && grep -Eqi 'serie[[:space:]-]*a|mansionbet' /tmp/mansion.browser.html; then
+              cp /tmp/mansion.browser.html mansion-snapshots/serie-a.html
+              cp /tmp/chrome.log mansion-snapshots/chrome.log || true
               printf '%s' "$country" > mansion-snapshots/relay-country.txt
               printf '%s' "$relay" > mansion-snapshots/relay-source-ip.txt
               printf '%s' "$exitip" > mansion-snapshots/exit-ip.txt
-              printf '%s' "$code" > mansion-snapshots/http-status.txt
+              printf '%s' "$code" > mansion-snapshots/curl-http-status.txt
+              printf '%s' 'chrome-vpn' > mansion-snapshots/fetch-method.txt
+              selected=1
+              break
+            fi
+            if [ "$code" = '200' ] && [ "$curlbytes" -ge 10000 ] \
+              && ! grep -Eqi 'access denied|forbidden|checking your browser|just a moment|captcha' /tmp/mansion.curl.html; then
+              cp /tmp/mansion.curl.html mansion-snapshots/serie-a.html
+              printf '%s' "$country" > mansion-snapshots/relay-country.txt
+              printf '%s' "$relay" > mansion-snapshots/relay-source-ip.txt
+              printf '%s' "$exitip" > mansion-snapshots/exit-ip.txt
+              printf '%s' "$code" > mansion-snapshots/curl-http-status.txt
+              printf '%s' 'curl-vpn' > mansion-snapshots/fetch-method.txt
               selected=1
               break
             fi
@@ -129,7 +153,7 @@ jobs:
           def z(n):
               try:return os.path.getsize(os.path.join(p,n))
               except:return 0
-          meta={'captured_at':datetime.datetime.now(datetime.timezone.utc).isoformat(),'target':'https://www.mansionbet.com/vn/serie-a/','success':r('success.txt')=='1','relay_country':r('relay-country.txt'),'relay_source_ip':r('relay-source-ip.txt'),'exit_ip':r('exit-ip.txt'),'http_status':r('http-status.txt'),'html_bytes':z('serie-a.html')}
+          meta={'captured_at':datetime.datetime.now(datetime.timezone.utc).isoformat(),'target':'https://www.mansionbet.com/vn/serie-a/','success':r('success.txt')=='1','relay_country':r('relay-country.txt'),'relay_source_ip':r('relay-source-ip.txt'),'exit_ip':r('exit-ip.txt'),'curl_http_status':r('curl-http-status.txt'),'fetch_method':r('fetch-method.txt'),'html_bytes':z('serie-a.html')}
           open(os.path.join(p,'meta.json'),'w',encoding='utf-8').write(json.dumps(meta,ensure_ascii=False,indent=2))
           print(json.dumps(meta,ensure_ascii=False,indent=2))
           PY
@@ -142,5 +166,5 @@ jobs:
           git config user.email 'runner-7-bot@users.noreply.github.com'
           git add mansion-snapshots
           if git diff --cached --quiet; then exit 0; fi
-          git commit -m 'chore: refresh Mansionbet Serie A via rotated IP'
+          git commit -m 'chore: refresh Mansionbet Serie A via VPN Chrome'
           git push
