@@ -5,6 +5,7 @@ on:
   push:
     paths:
       - '.mansion-fetch-trigger'
+      - '.github/workflows/mansion-seriea-fetch.yml'
 
 permissions:
   contents: write
@@ -14,129 +15,132 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Fetch with runner IP
-        id: curlfetch
+      - name: Install VPN tools
         shell: bash
         run: |
-          set -u
-          mkdir -p mansion-snapshots
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq openvpn iproute2 iptables curl
+
+      - name: Build Asia relay pool
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p mansion-snapshots /tmp/mansion-relays
+          curl -fsSL --max-time 30 'https://www.vpngate.net/api/iphone/' -o /tmp/vpngate.csv
+          python3 - <<'PY'
+          import base64,csv,io,pathlib
+          pref=['VN','SG','TH','MY','PH','ID','JP','KR','TW']
+          raw=pathlib.Path('/tmp/vpngate.csv').read_text(encoding='utf-8-sig',errors='replace')
+          rows=list(csv.DictReader(io.StringIO('\n'.join(x for x in raw.splitlines() if x and not x.startswith('*')))))
+          pathlib.Path('/tmp/auth').write_text('vpn\nvpn\n')
+          picked=[]
+          for c in pref:
+              rs=[r for r in rows if (r.get('CountryShort') or '').upper()==c and (r.get('OpenVPN_ConfigData_Base64') or '').strip()]
+              rs.sort(key=lambda r:int(r.get('Speed') or 0),reverse=True)
+              picked.extend((c,r) for r in rs[:4])
+          if not picked: raise SystemExit('No Asia VPN Gate relay')
+          meta=[]
+          for i,(c,r) in enumerate(picked):
+              cfg=base64.b64decode(r['OpenVPN_ConfigData_Base64']).decode(errors='replace')
+              cfg='\n'.join('auth-user-pass /tmp/auth' if x.strip().startswith('auth-user-pass') else x for x in cfg.splitlines())+'\n'
+              p=pathlib.Path(f'/tmp/mansion-relays/{i:02d}-{c}.ovpn')
+              p.write_text(cfg)
+              meta.append(f'{p}\t{c}\t{r.get("IP","")}')
+          pathlib.Path('/tmp/mansion-relays.tsv').write_text('\n'.join(meta)+'\n')
+          print('RELAYS='+str(len(meta)))
+          PY
+
+      - name: Rotate IP until Mansionbet opens
+        shell: bash
+        run: |
+          set -euo pipefail
           TARGET='https://www.mansionbet.com/vn/serie-a/'
-          RUNNER_IP=$(curl -fsS --max-time 10 https://api.ipify.org || true)
-          printf '%s' "$RUNNER_IP" > mansion-snapshots/runner-ip.txt
-          CODE=$(curl -L --compressed --max-time 45 \
-            -A 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36' \
-            -H 'Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8' \
-            -H 'Accept-Language: vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7' \
-            -H 'Cache-Control: no-cache' \
-            -H 'Pragma: no-cache' \
-            -H 'Upgrade-Insecure-Requests: 1' \
-            -D mansion-snapshots/serie-a.headers.txt \
-            -o mansion-snapshots/serie-a.curl.html \
-            -w '%{http_code}' "$TARGET" || true)
-          printf '%s' "$CODE" > mansion-snapshots/curl-status.txt
-          SIZE=$(wc -c < mansion-snapshots/serie-a.curl.html 2>/dev/null || echo 0)
-          echo "code=$CODE" >> "$GITHUB_OUTPUT"
-          echo "size=$SIZE" >> "$GITHUB_OUTPUT"
-          echo "RUNNER_IP=$RUNNER_IP HTTP=$CODE BYTES=$SIZE"
-
-      - name: Decide browser fallback
-        id: decide
-        shell: bash
-        run: |
-          CODE='${{ steps.curlfetch.outputs.code }}'
-          SIZE='${{ steps.curlfetch.outputs.size }}'
-          NEED=0
-          if [ "$CODE" != '200' ] || [ "${SIZE:-0}" -lt 10000 ]; then NEED=1; fi
-          if grep -Eqi 'access denied|captcha|cloudflare|forbidden|checking your browser|just a moment' mansion-snapshots/serie-a.curl.html 2>/dev/null; then NEED=1; fi
-          echo "need=$NEED" >> "$GITHUB_OUTPUT"
-
-      - name: Install Playwright
-        if: steps.decide.outputs.need == '1'
-        shell: bash
-        run: |
-          npm init -y >/dev/null 2>&1
-          npm install playwright@1.55.0 >/dev/null 2>&1
-          npx playwright install --with-deps chromium
-
-      - name: Fetch with Chromium
-        if: steps.decide.outputs.need == '1'
-        shell: bash
-        run: |
-          cat > /tmp/fetch-mansion.js <<'JS'
-          const { chromium } = require('playwright');
-          const fs = require('fs');
-          (async () => {
-            const browser = await chromium.launch({headless:true});
-            const context = await browser.newContext({
-              locale: 'vi-VN',
-              timezoneId: 'Asia/Ho_Chi_Minh',
-              userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36',
-              viewport: {width: 1440, height: 1200}
-            });
-            const page = await context.newPage();
-            let status = 0;
-            try {
-              const r = await page.goto('https://www.mansionbet.com/vn/serie-a/', {waitUntil:'domcontentloaded', timeout:60000});
-              status = r ? r.status() : 0;
-              await page.waitForTimeout(8000);
-              const html = await page.content();
-              fs.writeFileSync('mansion-snapshots/serie-a.browser.html', html);
-              fs.writeFileSync('mansion-snapshots/browser-title.txt', await page.title());
-              fs.writeFileSync('mansion-snapshots/browser-url.txt', page.url());
-              fs.writeFileSync('mansion-snapshots/browser-status.txt', String(status));
-              await page.screenshot({path:'mansion-snapshots/serie-a.png', fullPage:true});
-              console.log(`BROWSER_STATUS=${status} BYTES=${Buffer.byteLength(html)} TITLE=${await page.title()} URL=${page.url()}`);
-            } catch (e) {
-              fs.writeFileSync('mansion-snapshots/browser-error.txt', String(e && e.stack || e));
-              console.error(e);
-            }
-            await browser.close();
-          })();
-          JS
-          node /tmp/fetch-mansion.js
+          IFACE=$(ip route show default | awk '{print $5; exit}')
+          sudo ip netns add vpnns
+          sudo ip link add vh type veth peer name vn
+          sudo ip link set vn netns vpnns
+          sudo ip addr add 10.236.0.1/24 dev vh
+          sudo ip link set vh up
+          sudo ip netns exec vpnns ip addr add 10.236.0.2/24 dev vn
+          sudo ip netns exec vpnns ip link set lo up
+          sudo ip netns exec vpnns ip link set vn up
+          sudo ip netns exec vpnns ip route add default via 10.236.0.1
+          sudo sysctl -w net.ipv4.ip_forward=1 >/dev/null
+          sudo iptables -t nat -A POSTROUTING -s 10.236.0.0/24 -o "$IFACE" -j MASQUERADE
+          sudo iptables -A FORWARD -i vh -o "$IFACE" -j ACCEPT
+          sudo iptables -A FORWARD -i "$IFACE" -o vh -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+          sudo mkdir -p /etc/netns/vpnns
+          printf 'nameserver 1.1.1.1\nnameserver 8.8.8.8\n' | sudo tee /etc/netns/vpnns/resolv.conf >/dev/null
+          : > mansion-snapshots/attempts.tsv
+          selected=0
+          while IFS=$'\t' read -r cfg country relay; do
+            echo "TRY $country $relay"
+            sudo ip netns exec vpnns pkill openvpn 2>/dev/null || true
+            sleep 1
+            sudo rm -f /tmp/openvpn.log /tmp/mansion.html /tmp/mansion.headers
+            sudo touch /tmp/openvpn.log && sudo chmod 644 /tmp/openvpn.log
+            sudo ip netns exec vpnns openvpn --config "$cfg" --daemon --log /tmp/openvpn.log || true
+            ok=0
+            for i in {1..14}; do
+              sleep 1
+              grep -q 'Initialization Sequence Completed' /tmp/openvpn.log 2>/dev/null && { ok=1; break; }
+              grep -Eq 'AUTH_FAILED|TLS Error|Connection timed out|Connection refused|fatal error' /tmp/openvpn.log 2>/dev/null && break || true
+            done
+            if [ "$ok" != 1 ]; then
+              printf '%s\t%s\tVPN_FAIL\t0\n' "$country" "$relay" >> mansion-snapshots/attempts.tsv
+              continue
+            fi
+            exitip=$(sudo ip netns exec vpnns curl -fsS --connect-timeout 6 --max-time 10 https://api.ipify.org || true)
+            code=$(sudo ip netns exec vpnns curl -L --compressed --connect-timeout 10 --max-time 40 \
+              -A 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36' \
+              -H 'Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8' \
+              -H 'Accept-Language: vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7' \
+              -H 'Cache-Control: no-cache' -H 'Pragma: no-cache' \
+              -D /tmp/mansion.headers -o /tmp/mansion.html -w '%{http_code}' "$TARGET" || true)
+            bytes=$(wc -c < /tmp/mansion.html 2>/dev/null || echo 0)
+            printf '%s\t%s\t%s\t%s\t%s\n' "$country" "$relay" "$exitip" "$code" "$bytes" >> mansion-snapshots/attempts.tsv
+            echo "RESULT country=$country relay=$relay exit_ip=$exitip http=$code bytes=$bytes"
+            if [ "$code" = '200' ] && [ "$bytes" -ge 10000 ] && ! grep -Eqi 'access denied|forbidden|checking your browser|just a moment|captcha' /tmp/mansion.html; then
+              cp /tmp/mansion.html mansion-snapshots/serie-a.html
+              cp /tmp/mansion.headers mansion-snapshots/serie-a.headers.txt
+              printf '%s' "$country" > mansion-snapshots/relay-country.txt
+              printf '%s' "$relay" > mansion-snapshots/relay-source-ip.txt
+              printf '%s' "$exitip" > mansion-snapshots/exit-ip.txt
+              printf '%s' "$code" > mansion-snapshots/http-status.txt
+              selected=1
+              break
+            fi
+          done < /tmp/mansion-relays.tsv
+          printf '%s' "$selected" > mansion-snapshots/success.txt
 
       - name: Build metadata
+        if: always()
         shell: bash
         run: |
           python3 - <<'PY'
-          import json, os, datetime
+          import json,os,datetime
           p='mansion-snapshots'
-          def read(name):
-              try:
-                  return open(os.path.join(p,name),encoding='utf-8',errors='replace').read().strip()
-              except Exception:
-                  return None
-          def size(name):
-              try: return os.path.getsize(os.path.join(p,name))
-              except Exception: return 0
-          meta={
-            'captured_at': datetime.datetime.now(datetime.timezone.utc).isoformat(),
-            'target':'https://www.mansionbet.com/vn/serie-a/',
-            'runner_ip':read('runner-ip.txt'),
-            'curl_status':read('curl-status.txt'),
-            'curl_bytes':size('serie-a.curl.html'),
-            'browser_status':read('browser-status.txt'),
-            'browser_bytes':size('serie-a.browser.html'),
-            'browser_title':read('browser-title.txt'),
-            'browser_url':read('browser-url.txt'),
-            'browser_error':read('browser-error.txt'),
-          }
+          def r(n):
+              try:return open(os.path.join(p,n),encoding='utf-8',errors='replace').read().strip()
+              except:return None
+          def z(n):
+              try:return os.path.getsize(os.path.join(p,n))
+              except:return 0
+          meta={'captured_at':datetime.datetime.now(datetime.timezone.utc).isoformat(),'target':'https://www.mansionbet.com/vn/serie-a/','success':r('success.txt')=='1','relay_country':r('relay-country.txt'),'relay_source_ip':r('relay-source-ip.txt'),'exit_ip':r('exit-ip.txt'),'http_status':r('http-status.txt'),'html_bytes':z('serie-a.html')}
           open(os.path.join(p,'meta.json'),'w',encoding='utf-8').write(json.dumps(meta,ensure_ascii=False,indent=2))
           print(json.dumps(meta,ensure_ascii=False,indent=2))
           PY
 
       - name: Publish snapshot
+        if: always()
         shell: bash
         run: |
           git config user.name 'runner-7-bot'
           git config user.email 'runner-7-bot@users.noreply.github.com'
           git add mansion-snapshots
-          if git diff --cached --quiet; then
-            echo 'No snapshot changes'
-            exit 0
-          fi
-          git commit -m 'chore: refresh Mansionbet Serie A snapshot'
+          if git diff --cached --quiet; then exit 0; fi
+          git commit -m 'chore: refresh Mansionbet Serie A via rotated IP'
           git push
