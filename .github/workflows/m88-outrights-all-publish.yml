@@ -14,7 +14,7 @@ permissions:
   contents: write
 
 concurrency:
-  group: m88-outrights-all-publisher-v2
+  group: m88-outrights-all-publisher-v3
   cancel-in-progress: false
 
 jobs:
@@ -35,7 +35,7 @@ jobs:
           python3 -m pip install -q 'playwright>=1.46,<2'
           mkdir -p evidence /tmp/relays
 
-      - name: Select M88-compatible Asia relay
+      - name: Build relay pool and connect
         shell: bash
         run: |
           set -euo pipefail
@@ -78,13 +78,14 @@ jobs:
           sudo mkdir -p /etc/netns/vpnns
           printf 'nameserver 1.1.1.1\nnameserver 8.8.8.8\n'|sudo tee /etc/netns/vpnns/resolv.conf >/dev/null
 
-          selected=0
-          while IFS=$'\t' read -r cfg country relay; do
-            echo "TRY $country $relay"
+          connect_and_probe() {
+            cfg="$1"; country="$2"; relay="$3"
+            echo "TRY_RELAY $country $relay"
             sudo ip netns exec vpnns pkill openvpn 2>/dev/null || true
             sleep 1
             sudo rm -f /tmp/o.log /tmp/top.json
-            sudo touch /tmp/o.log; sudo chmod 644 /tmp/o.log
+            sudo touch /tmp/o.log
+            sudo chmod 644 /tmp/o.log
             sudo ip netns exec vpnns openvpn --config "$cfg" --daemon --log /tmp/o.log || true
             ok=0
             for i in {1..12}; do
@@ -92,38 +93,113 @@ jobs:
               grep -q 'Initialization Sequence Completed' /tmp/o.log 2>/dev/null && { ok=1; break; }
               grep -Eq 'AUTH_FAILED|TLS Error|Connection timed out|Connection refused|fatal error' /tmp/o.log 2>/dev/null && break || true
             done
-            [ "$ok" = 1 ] || continue
-            if sudo ip netns exec vpnns curl -fsS --max-time 15 'https://msports.m88.com/api/v1/sport/top?currency=VND' -H 'Authorization: Bearer GUEST' -o /tmp/top.json; then
-              if python3 - <<'PY'
+            [ "$ok" = 1 ] || return 1
+            sudo ip netns exec vpnns curl -fsS --connect-timeout 8 --max-time 15 \
+              'https://msports.m88.com/api/v1/sport/top?currency=VND' \
+              -H 'Authorization: Bearer GUEST' -o /tmp/top.json || return 1
+            python3 - <<'PY'
           import json
-          try:d=json.load(open('/tmp/top.json'))
-          except Exception:raise SystemExit(1)
+          try:
+              d=json.load(open('/tmp/top.json'))
+          except Exception:
+              raise SystemExit(1)
           raise SystemExit(0 if d.get('status')==1 else 1)
           PY
-              then
-                echo "$country $relay" | tee evidence/relay.txt
-                selected=1
-                break
-              fi
+          }
+
+          selected=0
+          while IFS=$'\t' read -r cfg country relay; do
+            if connect_and_probe "$cfg" "$country" "$relay"; then
+              printf '%s\t%s\t%s\n' "$cfg" "$country" "$relay" > /tmp/selected-relay.tsv
+              echo "$country $relay" | tee evidence/relay.txt
+              selected=1
+              break
             fi
           done </tmp/relays.tsv
           test "$selected" = 1
 
-      - name: Capture exact M88 SABA Outright board
+      - name: Capture SABA Outright with retry and relay failover
         shell: bash
         run: |
           set -euo pipefail
-          sudo ip netns exec vpnns runuser -u runner -- env HOME=/home/runner WORKSPACE="$GITHUB_WORKSPACE" python3 "$GITHUB_WORKSPACE/m88_outrights_capture.py"
-          test -s evidence/m88-outrights-all.json
-          python3 - <<'PY'
+
+          validate_capture() {
+            test -s evidence/m88-outrights-all.json || return 1
+            python3 - <<'PY'
           import json
           d=json.load(open('evidence/m88-outrights-all.json'))
           c=d.get('coverage') or {}
           ratio=float(c.get('capture_ratio') or 0)
           print('OUTRIGHT_COVERAGE',json.dumps(c,ensure_ascii=False))
-          if ratio < .90:
-              raise SystemExit(f'Production safety gate: {ratio:.2%} < 90%')
+          raise SystemExit(0 if ratio >= .90 else 1)
           PY
+          }
+
+          capture_once() {
+            n="$1"
+            rm -f evidence/m88-outrights-all.json evidence/m88-outrights-health.json
+            echo "CAPTURE_ATTEMPT=$n"
+            if sudo ip netns exec vpnns timeout 360s runuser -u runner -- \
+              env HOME=/home/runner WORKSPACE="$GITHUB_WORKSPACE" \
+              python3 "$GITHUB_WORKSPACE/m88_outrights_capture.py" \
+              > >(tee "evidence/capture-attempt-${n}.log") \
+              2> >(tee -a "evidence/capture-attempt-${n}.log" >&2); then
+              if validate_capture; then
+                echo "CAPTURE_ATTEMPT_${n}=PASS"
+                return 0
+              fi
+            fi
+            echo "CAPTURE_ATTEMPT_${n}=FAIL"
+            return 1
+          }
+
+          connect_and_probe() {
+            cfg="$1"; country="$2"; relay="$3"
+            echo "FAILOVER_RELAY $country $relay"
+            sudo ip netns exec vpnns pkill openvpn 2>/dev/null || true
+            sleep 1
+            sudo rm -f /tmp/o.log /tmp/top.json
+            sudo touch /tmp/o.log
+            sudo chmod 644 /tmp/o.log
+            sudo ip netns exec vpnns openvpn --config "$cfg" --daemon --log /tmp/o.log || true
+            ok=0
+            for i in {1..12}; do
+              sleep 1
+              grep -q 'Initialization Sequence Completed' /tmp/o.log 2>/dev/null && { ok=1; break; }
+              grep -Eq 'AUTH_FAILED|TLS Error|Connection timed out|Connection refused|fatal error' /tmp/o.log 2>/dev/null && break || true
+            done
+            [ "$ok" = 1 ] || return 1
+            sudo ip netns exec vpnns curl -fsS --connect-timeout 8 --max-time 15 \
+              'https://msports.m88.com/api/v1/sport/top?currency=VND' \
+              -H 'Authorization: Bearer GUEST' -o /tmp/top.json || return 1
+            python3 - <<'PY'
+          import json
+          try:
+              d=json.load(open('/tmp/top.json'))
+          except Exception:
+              raise SystemExit(1)
+          raise SystemExit(0 if d.get('status')==1 else 1)
+          PY
+          }
+
+          if capture_once 1; then
+            exit 0
+          fi
+
+          current_cfg=$(cut -f1 /tmp/selected-relay.tsv)
+          failover_used=0
+          while IFS=$'\t' read -r cfg country relay; do
+            [ "$cfg" = "$current_cfg" ] && continue
+            if connect_and_probe "$cfg" "$country" "$relay"; then
+              printf '%s\t%s\t%s\n' "$cfg" "$country" "$relay" > /tmp/selected-relay.tsv
+              echo "$country $relay" | tee evidence/relay.txt
+              failover_used=1
+              break
+            fi
+          done </tmp/relays.tsv
+
+          [ "$failover_used" = 1 ] || { echo 'NO_FAILOVER_RELAY'; exit 1; }
+          capture_once 2
 
       - name: Publish last-good full Outright snapshot
         env:
