@@ -27,14 +27,14 @@ jobs:
           files=$(gh pr diff "$PR_NUMBER" --repo "$GITHUB_REPOSITORY" --name-only)
           printf '%s\n' "$files"
           if grep -qx '.m88-live-trigger' <<<"$files"; then
-            gh workflow run m88-live-publish.yml --repo "$GITHUB_REPOSITORY" --ref main
-            echo 'DISPATCHED=m88-live-publish.yml'
+            gh workflow run m88-live-ai-publish.yml --repo "$GITHUB_REPOSITORY" --ref main
+            echo 'DISPATCHED=m88-live-ai-publish.yml'
           fi
           if grep -qx '.m88-outrights-trigger' <<<"$files"; then
             gh workflow run m88-outrights-all-publish.yml --repo "$GITHUB_REPOSITORY" --ref main
             echo 'DISPATCHED=m88-outrights-all-publish.yml'
           fi
           if grep -qx '.m88-ai-trigger' <<<"$files"; then
-            gh workflow run m88-ai-sharded-publish.yml --repo "$GITHUB_REPOSITORY" --ref main
-            echo 'DISPATCHED=m88-ai-sharded-publish.yml'
+            gh workflow run m88-live-ai-publish.yml --repo "$GITHUB_REPOSITORY" --ref main
+            echo 'DISPATCHED=m88-live-ai-publish.yml'
           fi
