@@ -32,7 +32,8 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p input out
-          gh api "repos/${GITHUB_REPOSITORY}/contents/data.json?ref=m88-live-data" --jq '.content' | tr -d '\n' | base64 -d > input/match-odds.json
+          git fetch --no-tags --depth=1 origin m88-live-data
+          git show FETCH_HEAD:data.json > input/match-odds.json
           gh release download m88-outrights-all --repo "$GITHUB_REPOSITORY" --pattern 'm88-outrights-all.json' --dir input --clobber
           mv input/m88-outrights-all.json input/outrights.json
           test -s input/match-odds.json
