@@ -1,10 +1,11 @@
 {
-  "captured_at": "2026-08-18T07:50:28.906712+00:00",
+  "captured_at": "2026-08-18T07:53:09.880245+00:00",
   "target": "https://www.mansionbet.com/vn/serie-a/",
-  "success": false,
-  "relay_country": null,
-  "relay_source_ip": null,
-  "exit_ip": null,
-  "http_status": null,
-  "html_bytes": 0
+  "success": true,
+  "relay_country": "JP",
+  "relay_source_ip": "219.100.37.82",
+  "exit_ip": "219.100.37.238",
+  "curl_http_status": "406",
+  "fetch_method": "chrome-vpn",
+  "html_bytes": 150382
 }
