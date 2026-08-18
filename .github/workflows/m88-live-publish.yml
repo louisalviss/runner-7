@@ -9,14 +9,18 @@ on:
       - 'm88_full_odds.py'
       - 'render_m88_full.py'
   schedule:
-    - cron: '*/5 * * * *'
+    # Offset from :00/:05 global scheduler peaks.
+    - cron: '2-59/5 * * * *'
 
 permissions:
+  actions: write
   contents: write
 
 concurrency:
-  group: m88-live-publisher-v2
-  cancel-in-progress: true
+  group: m88-live-publisher-v3
+  # Never kill a run that already obtained a runner. GitHub will keep at most
+  # one pending run for this concurrency group while the active run finishes.
+  cancel-in-progress: false
 
 jobs:
   publish:
@@ -123,6 +127,8 @@ jobs:
           PY
 
       - name: Fetch normalize and publish one fresh snapshot
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           fetch_group() {
@@ -149,7 +155,7 @@ jobs:
             for g in 2 4 5 6 7 8; do fetch_group "$scope" "$g" || rm -f "evidence/${scope}_g${g}.json"; done
           }
 
-          fetch_full_scope live
+          fetch_full_scope live || echo 'LIVE_EMPTY_OR_UNAVAILABLE'
           fetch_full_scope today || echo 'TODAY_OPTIONAL_MISS'
           fetch_full_scope early || echo 'EARLY_OPTIONAL_MISS'
 
@@ -157,16 +163,22 @@ jobs:
           python3 - <<'PY'
           import json,pathlib,re
           p=pathlib.Path('publish/data.json');d=json.loads(p.read_text())
-          live=[m for m in d.get('matches',[]) if m.get('scope')=='live']
-          real=[m for m in live if not re.search(r'virtual|esoccer|e-soccer|pes\s?\d|simulated|cyber|\(v\)', ' '.join([(m.get('league') or {}).get('name',''),m.get('home',''),m.get('away','')]), re.I)]
+          matches=d.get('matches',[])
+          def virtual(m):
+              text=' '.join([(m.get('league') or {}).get('name',''),m.get('home',''),m.get('away','')])
+              return bool(re.search(r'virtual|esoccer|e-soccer|pes\s?\d|simulated|cyber|\(v\)',text,re.I))
+          real=[m for m in matches if not virtual(m)]
+          by_scope={s:sum(1 for m in real if m.get('scope')==s) for s in ('live','today','early')}
           sels=(d.get('counts') or {}).get('total_selections',0)
-          if not real or sels < 50: raise SystemExit(f'Unsafe snapshot real_live={len(real)} selections={sels}')
+          if len(real) < 10 or sels < 50:
+              raise SystemExit(f'Unsafe snapshot real_matches={len(real)} selections={sels}')
           d['live_generated_at']=d.get('generated_at') or d.get('captured_at')
           d['source_mode']='direct_m88_guest_full_market_groups'
           d['exact_operator_odds']=True
           d['source_provenance']='direct_m88_msports_guest'
+          d['real_match_counts']=by_scope
           p.write_text(json.dumps(d,separators=(',',':'),ensure_ascii=False))
-          print('REAL_LIVE='+str(len(real)));print('FULL_SELECTIONS='+str(sels))
+          print('REAL_MATCHES='+str(len(real)));print('REAL_BY_SCOPE='+json.dumps(by_scope));print('FULL_SELECTIONS='+str(sels))
           PY
           python3 render_m88_full.py --input publish/data.json --output publish/index.html
           grep -q '<details class="match"' publish/index.html
@@ -188,3 +200,6 @@ jobs:
           git -C /tmp/m88-pub commit -q -m "M88 sports odds $(date -u +'%Y-%m-%d %H:%M:%S UTC')"
           git -C /tmp/m88-pub push -q --force origin HEAD:m88-live-data
           echo 'PUBLISHED_FRESH_SNAPSHOT=1'
+
+          # Rebuild AI index/shards immediately from the snapshot that just passed validation.
+          gh workflow run m88-ai-sharded-publish.yml --repo "$GITHUB_REPOSITORY" --ref main || echo 'AI_DISPATCH_DEFERRED=1'
