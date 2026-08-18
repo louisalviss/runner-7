@@ -1,0 +1,160 @@
+name: Runner7 M88 AI Sharded Publisher
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '*/5 * * * *'
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/m88-ai-sharded-publish.yml'
+      - 'build_m88_ai_database.py'
+      - 'build_m88_ai_shards.py'
+      - '.m88-ai-trigger'
+
+permissions:
+  contents: write
+
+concurrency:
+  group: runner7-m88-ai-sharded-publisher
+  cancel-in-progress: true
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch Runner7 exact M88 source datasets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p input out
+          stamp=$(date +%s)
+          curl -LfsS --retry 4 --max-time 35 "https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/m88-live-data/data.json?v=${stamp}" -o input/match-odds.json
+          gh release download m88-outrights-all --repo "$GITHUB_REPOSITORY" --pattern 'M88-outrights-all.json' --dir input --clobber
+          mv input/M88-outrights-all.json input/outrights.json
+          test -s input/match-odds.json
+          test -s input/outrights.json
+
+      - name: Build canonical master
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 build_m88_ai_database.py \
+            --matches input/match-odds.json \
+            --outrights input/outrights.json \
+            --output out/ai-odds.json \
+            --health out/health.json
+          test -s out/ai-odds.json
+          test -s out/health.json
+
+      - name: Build AI navigation shards
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 build_m88_ai_shards.py --input out/ai-odds.json --output-dir out
+          test -s out/index.json
+          test -s out/matches/live.json
+          test -s out/matches/today.json
+          test -s out/matches/early.json
+          test -s out/outrights/index.json
+
+      - name: Validate master and smoke index to EPL Winner to Arsenal
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          root=Path('out')
+          master=json.loads((root/'ai-odds.json').read_text(encoding='utf-8'))
+          assert master.get('schema_version') == 3
+          assert master.get('operator') == 'M88'
+          assert master.get('canonical') is True
+          idx=master.get('index') or {}
+          assert int(idx.get('match_count') or 0) >= 50
+          assert int(idx.get('outright_market_count') or 0) >= 40
+          assert float((((master.get('freshness') or {}).get('outrights') or {}).get('capture_ratio') or 0)) >= 0.90
+
+          nav=json.loads((root/'index.json').read_text(encoding='utf-8'))
+          assert nav.get('canonical_master') == 'ai-odds.json'
+          oi_path=(nav.get('outrights') or {}).get('index')
+          assert oi_path
+          oi=json.loads((root/oi_path).read_text(encoding='utf-8'))
+          epl=next((x for x in oi.get('competitions',[]) if x.get('slug')=='epl'),None)
+          if not epl:
+              raise SystemExit('SMOKE_FAIL: EPL competition shard not found')
+          shard=json.loads((root/epl['path']).read_text(encoding='utf-8'))
+          winner=next((m for m in shard.get('markets',[]) if (m.get('market_name_guess') or '').strip().casefold()=='winner'),None)
+          if not winner:
+              winner=next((m for m in shard.get('markets',[]) if str(m.get('title') or '').strip().casefold().endswith(' - winner')),None)
+          if not winner:
+              raise SystemExit('SMOKE_FAIL: EPL Winner market not found')
+          arsenal=next((s for s in winner.get('selections',[]) if str(s.get('name') or '').strip().casefold()=='arsenal'),None)
+          if not arsenal or arsenal.get('odds') is None:
+              raise SystemExit('SMOKE_FAIL: Arsenal selection/odds not found')
+          print(json.dumps({
+              'smoke':'PASS',
+              'path':['index.json',oi_path,epl['path']],
+              'competition':epl.get('competition'),
+              'market_id':winner.get('market_id'),
+              'market':winner.get('title'),
+              'selection':arsenal.get('name'),
+              'odds':arsenal.get('odds')
+          },ensure_ascii=False))
+          PY
+
+      - name: Publish stable sharded database branch
+        shell: bash
+        run: |
+          set -euo pipefail
+          AUTH_HEADER=$(git config --local --get http.https://github.com/.extraheader || true)
+          rm -rf /tmp/m88-ai-pub
+          git init -q /tmp/m88-ai-pub
+          git -C /tmp/m88-ai-pub config user.name 'github-actions[bot]'
+          git -C /tmp/m88-ai-pub config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git -C /tmp/m88-ai-pub remote add origin "https://github.com/${GITHUB_REPOSITORY}.git"
+          [ -z "$AUTH_HEADER" ] || git -C /tmp/m88-ai-pub config http.https://github.com/.extraheader "$AUTH_HEADER"
+          git -C /tmp/m88-ai-pub checkout --orphan m88-ai-data >/dev/null 2>&1
+          cp -R out/. /tmp/m88-ai-pub/
+          cat > /tmp/m88-ai-pub/README.md <<EOF
+          # Runner7 M88 AI Odds Database
+
+          Canonical master: ai-odds.json
+          Navigation root: index.json
+          Match shards: matches/{live,today,early}.json
+          Outright competition index: outrights/index.json
+          Exact source policy: direct M88/MSports guest feed for match odds; native M88 -> SABA guest-board capture for Outrights. Never substitute another bookmaker for M88.
+          EOF
+          git -C /tmp/m88-ai-pub add .
+          git -C /tmp/m88-ai-pub commit -q -m "Runner7 M88 AI database $(date -u +'%Y-%m-%d %H:%M:%S UTC')"
+          git -C /tmp/m88-ai-pub push -q --force origin HEAD:m88-ai-data
+
+      - name: Publish stable release endpoints
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          tar -C out -czf m88-ai-shards.tar.gz index.json matches outrights
+          if ! gh release view m88-ai-current --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release create m88-ai-current --repo "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" --title 'Runner7 M88 AI Current Database' --notes 'Canonical M88 AI database and navigation shards.'
+          fi
+          gh release upload m88-ai-current --repo "$GITHUB_REPOSITORY" \
+            out/ai-odds.json#ai-odds.json \
+            out/health.json#health.json \
+            out/index.json#index.json \
+            m88-ai-shards.tar.gz#m88-ai-shards.tar.gz \
+            --clobber
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: runner7-m88-ai-${{ github.run_id }}
+          path: out/
+          retention-days: 2
