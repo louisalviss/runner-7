@@ -15,21 +15,23 @@ permissions:
   contents: write
 
 concurrency:
-  group: m88-live-publisher
+  group: m88-live-publisher-v2
   cancel-in-progress: true
 
 jobs:
   publish:
     runs-on: ubuntu-latest
-    timeout-minutes: 10
+    timeout-minutes: 7
     steps:
       - uses: actions/checkout@v4
 
       - name: Install VPN tools
         run: |
           set -euo pipefail
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq openvpn iproute2 iptables curl
+          if ! command -v openvpn >/dev/null 2>&1; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq openvpn iproute2 iptables curl
+          fi
 
       - name: Build Asia relay pool
         run: |
@@ -120,7 +122,7 @@ jobs:
                   pathlib.Path(f'/tmp/{scope}_g{group}.req').write_text(json.dumps(p,separators=(',',':')))
           PY
 
-      - name: Fetch, normalize and publish full markets
+      - name: Fetch normalize and publish one fresh snapshot
         run: |
           set -euo pipefail
           fetch_group() {
@@ -151,69 +153,38 @@ jobs:
           fetch_full_scope today || echo 'TODAY_OPTIONAL_MISS'
           fetch_full_scope early || echo 'EARLY_OPTIONAL_MISS'
 
+          python3 m88_full_odds.py --input-dir evidence --output-json publish/data.json --output-csv publish/odds.csv --odds-format decimal
           python3 - <<'PY'
-          import json,pathlib,re
-          for scope in ('live','today','early'):
-              p=pathlib.Path(f'evidence/{scope}_g2.json')
-              if not p.exists():
-                  print(f'SPECIAL {scope}: MISSING'); continue
-              d=json.loads(p.read_text()); rows=[]
-              for block in d.get('data') or []:
-                  if isinstance(block,dict): rows += [r for r in (block.get('data') or []) if isinstance(r,dict)]
-              suffixes={}
-              for r in rows:
-                  for k,v in r.items():
-                      if not str(v or '').strip(): continue
-                      m=re.match(r'(?:game_type|sub_partai|odds_\d+)_([A-Za-z]+)$',k)
-                      if m: suffixes.setdefault(m.group(1),set()).add(k)
-              print(f'SPECIAL {scope}: status={d.get("status")} rows={len(rows)} bytes={p.stat().st_size} suffixes={ {k:sorted(v) for k,v in suffixes.items()} }')
-              shown=0
-              for r in rows:
-                  rel={k:v for k,v in r.items() if (k.startswith('game_type_') or k.startswith('sub_partai_') or k.startswith('odds_')) and str(v or '').strip()}
-                  if rel:
-                      print('SPECIAL_SAMPLE',scope,r.get('club_home'),'vs',r.get('club_away'),json.dumps(rel,ensure_ascii=False)[:5000])
-                      shown+=1
-                      if shown>=3: break
-          PY
-
-          AUTH_HEADER=$(git config --local --get http.https://github.com/.extraheader || true)
-          publish_once() {
-            iteration="$1"
-            python3 m88_full_odds.py --input-dir evidence --output-json publish/data.json --output-csv publish/odds.csv --odds-format decimal
-            python3 - <<'PY'
           import json,pathlib,re
           p=pathlib.Path('publish/data.json');d=json.loads(p.read_text())
           live=[m for m in d.get('matches',[]) if m.get('scope')=='live']
           real=[m for m in live if not re.search(r'virtual|esoccer|e-soccer|pes\s?\d|simulated|cyber|\(v\)', ' '.join([(m.get('league') or {}).get('name',''),m.get('home',''),m.get('away','')]), re.I)]
           sels=(d.get('counts') or {}).get('total_selections',0)
           if not real or sels < 50: raise SystemExit(f'Unsafe snapshot real_live={len(real)} selections={sels}')
-          d['live_generated_at']=d.get('generated_at');d['source_mode']='direct_m88_guest_full_market_groups'
+          d['live_generated_at']=d.get('generated_at') or d.get('captured_at')
+          d['source_mode']='direct_m88_guest_full_market_groups'
+          d['exact_operator_odds']=True
+          d['source_provenance']='direct_m88_msports_guest'
           p.write_text(json.dumps(d,separators=(',',':'),ensure_ascii=False))
-          print('REAL_LIVE='+str(len(real)));print('FULL_SELECTIONS='+str(sels));print('MARKETS='+','.join(sorted((d.get('counts') or {}).get('selections',{}))))
+          print('REAL_LIVE='+str(len(real)));print('FULL_SELECTIONS='+str(sels))
           PY
-            python3 render_m88_full.py --input publish/data.json --output publish/index.html
-            grep -q '<details class="match"' publish/index.html
-            ! grep -q 'ĐĂNG NHẬP' publish/index.html
-            ! grep -q 'CASINO' publish/index.html
+          python3 render_m88_full.py --input publish/data.json --output publish/index.html
+          grep -q '<details class="match"' publish/index.html
+          ! grep -q 'ĐĂNG NHẬP' publish/index.html
+          ! grep -q 'CASINO' publish/index.html
 
-            rm -rf /tmp/m88-pub
-            git init -q /tmp/m88-pub
-            git -C /tmp/m88-pub config user.name 'github-actions[bot]'
-            git -C /tmp/m88-pub config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-            git -C /tmp/m88-pub remote add origin "https://github.com/${GITHUB_REPOSITORY}.git"
-            [ -z "$AUTH_HEADER" ] || git -C /tmp/m88-pub config http.https://github.com/.extraheader "$AUTH_HEADER"
-            git -C /tmp/m88-pub checkout --orphan m88-live-data >/dev/null 2>&1
-            cp publish/data.json publish/index.html publish/odds.csv /tmp/m88-pub/
-            printf '%s\n' "M88 sports odds only. Poll iteration ${iteration}." > /tmp/m88-pub/README.md
-            touch /tmp/m88-pub/.nojekyll
-            git -C /tmp/m88-pub add .
-            git -C /tmp/m88-pub commit -q -m "M88 sports odds $(date -u +'%Y-%m-%d %H:%M:%S UTC')"
-            git -C /tmp/m88-pub push -q --force origin HEAD:m88-live-data
-            echo "PUBLISHED_ITERATION=$iteration"
-          }
-
-          publish_once 1
-          for iteration in 2 3 4; do
-            sleep 45
-            if fetch_full_scope live; then publish_once "$iteration"; else echo "LIVE_REFRESH_${iteration}=KEEP_LAST"; fi
-          done
+          AUTH_HEADER=$(git config --local --get http.https://github.com/.extraheader || true)
+          rm -rf /tmp/m88-pub
+          git init -q /tmp/m88-pub
+          git -C /tmp/m88-pub config user.name 'github-actions[bot]'
+          git -C /tmp/m88-pub config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git -C /tmp/m88-pub remote add origin "https://github.com/${GITHUB_REPOSITORY}.git"
+          [ -z "$AUTH_HEADER" ] || git -C /tmp/m88-pub config http.https://github.com/.extraheader "$AUTH_HEADER"
+          git -C /tmp/m88-pub checkout --orphan m88-live-data >/dev/null 2>&1
+          cp publish/data.json publish/index.html publish/odds.csv /tmp/m88-pub/
+          printf '%s\n' 'M88 sports odds only. Runner7 one-shot fresh snapshot.' > /tmp/m88-pub/README.md
+          touch /tmp/m88-pub/.nojekyll
+          git -C /tmp/m88-pub add .
+          git -C /tmp/m88-pub commit -q -m "M88 sports odds $(date -u +'%Y-%m-%d %H:%M:%S UTC')"
+          git -C /tmp/m88-pub push -q --force origin HEAD:m88-live-data
+          echo 'PUBLISHED_FRESH_SNAPSHOT=1'
