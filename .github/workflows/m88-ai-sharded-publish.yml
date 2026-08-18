@@ -32,8 +32,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p input out
-          stamp=$(date +%s)
-          curl -LfsS --retry 4 --max-time 35 "https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/m88-live-data/data.json?v=${stamp}" -o input/match-odds.json
+          gh api "repos/${GITHUB_REPOSITORY}/contents/data.json?ref=m88-live-data" --jq '.content' | tr -d '\n' | base64 -d > input/match-odds.json
           gh release download m88-outrights-all --repo "$GITHUB_REPOSITORY" --pattern 'm88-outrights-all.json' --dir input --clobber
           mv input/m88-outrights-all.json input/outrights.json
           test -s input/match-odds.json
