@@ -1,3 +1,4 @@
+# trigger: 2026-08-18 runner7 migration
 name: Bootstrap M88 Pipeline From Runner3
 
 on:
