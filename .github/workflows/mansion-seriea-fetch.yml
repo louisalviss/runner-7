@@ -2,64 +2,55 @@ name: Mansionbet Serie A Fetch
 
 on:
   workflow_dispatch:
-  push:
-    paths:
-      - '.mansion-fetch-trigger'
-      - '.github/workflows/mansion-seriea-fetch.yml'
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   fetch:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 12
     steps:
-      - uses: actions/checkout@v4
-
-      - name: Install VPN tools
+      - name: Install tools
         shell: bash
         run: |
           set -euo pipefail
           sudo apt-get update -qq
           sudo apt-get install -y -qq openvpn iproute2 iptables curl
-          command -v google-chrome || command -v chromium || command -v chromium-browser || true
+          python3 -m pip install -q beautifulsoup4 lxml
 
-      - name: Build Asia relay pool
+      - name: Build relay pool
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p mansion-snapshots /tmp/mansion-relays
+          mkdir -p /tmp/mansion-relays
           curl -fsSL --max-time 30 'https://www.vpngate.net/api/iphone/' -o /tmp/vpngate.csv
           python3 - <<'PY'
           import base64,csv,io,pathlib
-          pref=['VN','SG','TH','MY','PH','ID','JP','KR','TW']
+          pref=['TH','SG','JP','KR','VN','MY','PH','ID','TW']
           raw=pathlib.Path('/tmp/vpngate.csv').read_text(encoding='utf-8-sig',errors='replace')
           rows=list(csv.DictReader(io.StringIO('\n'.join(x for x in raw.splitlines() if x and not x.startswith('*')))))
           pathlib.Path('/tmp/auth').write_text('vpn\nvpn\n')
-          picked=[]
+          out=[]
           for c in pref:
               rs=[r for r in rows if (r.get('CountryShort') or '').upper()==c and (r.get('OpenVPN_ConfigData_Base64') or '').strip()]
               rs.sort(key=lambda r:int(r.get('Speed') or 0),reverse=True)
-              picked.extend((c,r) for r in rs[:3])
-          if not picked: raise SystemExit('No Asia VPN Gate relay')
-          meta=[]
-          for i,(c,r) in enumerate(picked):
-              cfg=base64.b64decode(r['OpenVPN_ConfigData_Base64']).decode(errors='replace')
-              cfg='\n'.join('auth-user-pass /tmp/auth' if x.strip().startswith('auth-user-pass') else x for x in cfg.splitlines())+'\n'
-              p=pathlib.Path(f'/tmp/mansion-relays/{i:02d}-{c}.ovpn')
-              p.write_text(cfg)
-              meta.append(f'{p}\t{c}\t{r.get("IP","")}')
-          pathlib.Path('/tmp/mansion-relays.tsv').write_text('\n'.join(meta)+'\n')
-          print('RELAYS='+str(len(meta)))
+              for r in rs[:3]:
+                  cfg=base64.b64decode(r['OpenVPN_ConfigData_Base64']).decode(errors='replace')
+                  cfg='\n'.join('auth-user-pass /tmp/auth' if x.strip().startswith('auth-user-pass') else x for x in cfg.splitlines())+'\n'
+                  p=pathlib.Path(f'/tmp/mansion-relays/{len(out):02d}-{c}.ovpn')
+                  p.write_text(cfg)
+                  out.append((str(p),c,r.get('IP','')))
+          if not out: raise SystemExit('No VPN relays')
+          pathlib.Path('/tmp/mansion-relays.tsv').write_text('\n'.join('\t'.join(x) for x in out)+'\n')
+          print('RELAYS',len(out))
           PY
 
-      - name: Rotate IP and use real Chrome fingerprint
+      - name: Rotate IP and fetch page
         shell: bash
         run: |
           set -euo pipefail
           TARGET='https://www.mansionbet.com/vn/serie-a/'
-          CHROME=$(command -v google-chrome || command -v chromium || command -v chromium-browser || true)
           IFACE=$(ip route show default | awk '{print $5; exit}')
           sudo ip netns add vpnns
           sudo ip link add vh type veth peer name vn
@@ -76,14 +67,14 @@ jobs:
           sudo iptables -A FORWARD -i "$IFACE" -o vh -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
           sudo mkdir -p /etc/netns/vpnns
           printf 'nameserver 1.1.1.1\nnameserver 8.8.8.8\n' | sudo tee /etc/netns/vpnns/resolv.conf >/dev/null
-          : > mansion-snapshots/attempts.tsv
-          selected=0
+
+          success=0
+          : > /tmp/attempts.tsv
           while IFS=$'\t' read -r cfg country relay; do
-            echo "TRY $country $relay"
+            echo "TRY country=$country relay=$relay"
             sudo ip netns exec vpnns pkill openvpn 2>/dev/null || true
             sleep 1
-            sudo rm -rf /tmp/chrome-profile
-            sudo rm -f /tmp/openvpn.log /tmp/mansion.curl.html /tmp/mansion.browser.html /tmp/chrome.log
+            sudo rm -f /tmp/openvpn.log /tmp/page.html
             sudo touch /tmp/openvpn.log && sudo chmod 644 /tmp/openvpn.log
             sudo ip netns exec vpnns openvpn --config "$cfg" --daemon --log /tmp/openvpn.log || true
             ok=0
@@ -93,78 +84,82 @@ jobs:
               grep -Eq 'AUTH_FAILED|TLS Error|Connection timed out|Connection refused|fatal error' /tmp/openvpn.log 2>/dev/null && break || true
             done
             if [ "$ok" != 1 ]; then
-              printf '%s\t%s\tVPN_FAIL\t0\t0\n' "$country" "$relay" >> mansion-snapshots/attempts.tsv
+              printf '%s\t%s\tVPN_FAIL\n' "$country" "$relay" >> /tmp/attempts.tsv
               continue
             fi
-            exitip=$(sudo ip netns exec vpnns curl -fsS --connect-timeout 6 --max-time 10 https://api.ipify.org || true)
-            code=$(sudo ip netns exec vpnns curl -L --compressed --connect-timeout 8 --max-time 25 \
+            exitip=$(sudo ip netns exec vpnns curl -fsS --connect-timeout 8 --max-time 12 https://api.ipify.org || true)
+            code=$(sudo ip netns exec vpnns curl -L --compressed --connect-timeout 10 --max-time 40 \
               -A 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36' \
+              -H 'Accept: text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8' \
               -H 'Accept-Language: vi-VN,vi;q=0.9,en-US;q=0.8,en;q=0.7' \
-              -o /tmp/mansion.curl.html -w '%{http_code}' "$TARGET" || true)
-            curlbytes=$(wc -c < /tmp/mansion.curl.html 2>/dev/null || echo 0)
-            browserbytes=0
-            if [ -n "$CHROME" ]; then
-              sudo ip netns exec vpnns timeout 55 "$CHROME" \
-                --headless=new --no-sandbox --disable-dev-shm-usage --disable-gpu \
-                --lang=vi-VN --window-size=1440,1800 --virtual-time-budget=10000 \
-                --user-data-dir=/tmp/chrome-profile --dump-dom "$TARGET" \
-                > /tmp/mansion.browser.html 2>/tmp/chrome.log || true
-              browserbytes=$(wc -c < /tmp/mansion.browser.html 2>/dev/null || echo 0)
-            fi
-            printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$country" "$relay" "$exitip" "$code" "$curlbytes" "$browserbytes" >> mansion-snapshots/attempts.tsv
-            echo "RESULT country=$country relay=$relay exit_ip=$exitip curl_http=$code curl_bytes=$curlbytes browser_bytes=$browserbytes"
-            if [ "$browserbytes" -ge 10000 ] \
-              && ! grep -Eqi 'access denied|forbidden|checking your browser|just a moment|captcha|ERR_[A-Z_]+' /tmp/mansion.browser.html \
-              && grep -Eqi 'serie[[:space:]-]*a|mansionbet' /tmp/mansion.browser.html; then
-              cp /tmp/mansion.browser.html mansion-snapshots/serie-a.html
-              cp /tmp/chrome.log mansion-snapshots/chrome.log || true
-              printf '%s' "$country" > mansion-snapshots/relay-country.txt
-              printf '%s' "$relay" > mansion-snapshots/relay-source-ip.txt
-              printf '%s' "$exitip" > mansion-snapshots/exit-ip.txt
-              printf '%s' "$code" > mansion-snapshots/curl-http-status.txt
-              printf '%s' 'chrome-vpn' > mansion-snapshots/fetch-method.txt
-              selected=1
-              break
-            fi
-            if [ "$code" = '200' ] && [ "$curlbytes" -ge 10000 ] \
-              && ! grep -Eqi 'access denied|forbidden|checking your browser|just a moment|captcha' /tmp/mansion.curl.html; then
-              cp /tmp/mansion.curl.html mansion-snapshots/serie-a.html
-              printf '%s' "$country" > mansion-snapshots/relay-country.txt
-              printf '%s' "$relay" > mansion-snapshots/relay-source-ip.txt
-              printf '%s' "$exitip" > mansion-snapshots/exit-ip.txt
-              printf '%s' "$code" > mansion-snapshots/curl-http-status.txt
-              printf '%s' 'curl-vpn' > mansion-snapshots/fetch-method.txt
-              selected=1
+              -H 'Cache-Control: no-cache' -H 'Pragma: no-cache' \
+              -o /tmp/page.html -w '%{http_code}' "$TARGET" || true)
+            bytes=$(wc -c < /tmp/page.html 2>/dev/null || echo 0)
+            printf '%s\t%s\t%s\t%s\t%s\n' "$country" "$relay" "$exitip" "$code" "$bytes" >> /tmp/attempts.tsv
+            echo "RESULT country=$country exit_ip=$exitip http=$code bytes=$bytes"
+            if [ "$code" = '200' ] && [ "$bytes" -ge 30000 ] && ! grep -Eqi 'access denied|forbidden|checking your browser|just a moment|captcha' /tmp/page.html; then
+              echo "$country" > /tmp/selected-country
+              echo "$relay" > /tmp/selected-relay
+              echo "$exitip" > /tmp/selected-exit-ip
+              success=1
               break
             fi
           done < /tmp/mansion-relays.tsv
-          printf '%s' "$selected" > mansion-snapshots/success.txt
+          echo '--- ATTEMPTS ---'
+          cat /tmp/attempts.tsv
+          test "$success" = 1
 
-      - name: Build metadata
-        if: always()
+      - name: Extract article structure and text
         shell: bash
         run: |
+          set -euo pipefail
           python3 - <<'PY'
-          import json,os,datetime
-          p='mansion-snapshots'
-          def r(n):
-              try:return open(os.path.join(p,n),encoding='utf-8',errors='replace').read().strip()
-              except:return None
-          def z(n):
-              try:return os.path.getsize(os.path.join(p,n))
-              except:return 0
-          meta={'captured_at':datetime.datetime.now(datetime.timezone.utc).isoformat(),'target':'https://www.mansionbet.com/vn/serie-a/','success':r('success.txt')=='1','relay_country':r('relay-country.txt'),'relay_source_ip':r('relay-source-ip.txt'),'exit_ip':r('exit-ip.txt'),'curl_http_status':r('curl-http-status.txt'),'fetch_method':r('fetch-method.txt'),'html_bytes':z('serie-a.html')}
-          open(os.path.join(p,'meta.json'),'w',encoding='utf-8').write(json.dumps(meta,ensure_ascii=False,indent=2))
-          print(json.dumps(meta,ensure_ascii=False,indent=2))
+          from bs4 import BeautifulSoup, Tag
+          import json,re,pathlib
+          html=pathlib.Path('/tmp/page.html').read_text(encoding='utf-8',errors='replace')
+          soup=BeautifulSoup(html,'lxml')
+          for x in soup(['script','style','noscript','svg']): x.decompose()
+          candidates=[
+              soup.select_one('article'),
+              soup.select_one('.entry-content'),
+              soup.select_one('.post-content'),
+              soup.select_one('.article-content'),
+              soup.select_one('main'),
+          ]
+          root=next((x for x in candidates if x and len(x.get_text(' ',strip=True))>1000),soup.body or soup)
+          print('BEGIN_MANSION_META')
+          print(json.dumps({
+              'title': soup.title.get_text(' ',strip=True) if soup.title else None,
+              'h1': [x.get_text(' ',strip=True) for x in soup.find_all('h1')],
+              'selected_country': pathlib.Path('/tmp/selected-country').read_text().strip() if pathlib.Path('/tmp/selected-country').exists() else None,
+              'selected_relay': pathlib.Path('/tmp/selected-relay').read_text().strip() if pathlib.Path('/tmp/selected-relay').exists() else None,
+              'exit_ip': pathlib.Path('/tmp/selected-exit-ip').read_text().strip() if pathlib.Path('/tmp/selected-exit-ip').exists() else None,
+              'html_bytes': len(html.encode()),
+              'root_tag': root.name,
+              'root_class': root.get('class') if isinstance(root,Tag) else None,
+          },ensure_ascii=False))
+          print('END_MANSION_META')
+          print('BEGIN_MANSION_EXTRACT')
+          seen=set()
+          for el in root.find_all(['h1','h2','h3','h4','h5','h6','p','ul','ol','table']):
+              if any(p.name in ['table','ul','ol'] for p in el.parents if p is not root):
+                  continue
+              if el.name in ['h1','h2','h3','h4','h5','h6']:
+                  t=' '.join(el.stripped_strings)
+                  if t: print(f'[{el.name.upper()}] {t}')
+              elif el.name=='p':
+                  t=' '.join(el.stripped_strings)
+                  if t and t not in seen:
+                      seen.add(t); print(f'[P] {t}')
+              elif el.name in ['ul','ol']:
+                  for li in el.find_all('li',recursive=False):
+                      t=' '.join(li.stripped_strings)
+                      if t: print(f'[LI] {t}')
+              elif el.name=='table':
+                  print('[TABLE]')
+                  for tr in el.find_all('tr'):
+                      cells=[' '.join(c.stripped_strings) for c in tr.find_all(['th','td'])]
+                      if cells: print(' | '.join(cells))
+                  print('[/TABLE]')
+          print('END_MANSION_EXTRACT')
           PY
-
-      - name: Publish snapshot
-        if: always()
-        shell: bash
-        run: |
-          git config user.name 'runner-7-bot'
-          git config user.email 'runner-7-bot@users.noreply.github.com'
-          git add mansion-snapshots
-          if git diff --cached --quiet; then exit 0; fi
-          git commit -m 'chore: refresh Mansionbet Serie A via VPN Chrome'
-          git push
