@@ -2,6 +2,10 @@ name: Runner7 M88 Pipeline Guardian
 
 on:
   workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/m88-freshness-watchdog.yml'
   schedule:
     # Offset from the primary :02/:07/:12... publisher schedule.
     - cron: '4-59/5 * * * *'
