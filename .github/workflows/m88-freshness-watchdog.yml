@@ -16,7 +16,7 @@ permissions:
   issues: write
 
 concurrency:
-  group: runner7-m88-pipeline-guardian-v2
+  group: runner7-m88-pipeline-guardian-v3
   cancel-in-progress: true
 
 jobs:
@@ -55,7 +55,7 @@ jobs:
 
           Reason: ${reason}
 
-          Current canonical data remains on \`m88-ai-data\`. The recovery branch \`m88-ai-last-good\` is intentionally NOT advanced while the pipeline is unhealthy, so consumers can fall back to the last snapshot that passed the guardian gates.
+          Current canonical data remains on \`m88-ai-data\`. The recovery branch \`m88-ai-last-good\` is intentionally NOT advanced while the pipeline is unhealthy.
 
           Checked at: $(date -u +'%Y-%m-%dT%H:%M:%SZ')
           EOF
@@ -75,19 +75,36 @@ jobs:
             echo "ALERT=CLOSED_RECOVERED:$issue"
           }
 
-          workflow_state() {
+          active_runs() {
             wf="$1"
-            gh run list --repo "$REPO" --workflow "$wf" --limit 1 \
-              --json status,conclusion,databaseId,createdAt \
-              --jq 'if length==0 then "missing|missing|0|" else .[0] | [.status, (.conclusion // ""), (.databaseId|tostring), .createdAt] | join("|") end'
+            gh run list --repo "$REPO" --workflow "$wf" --limit 20 \
+              --json status \
+              --jq '[.[] | select(.status=="queued" or .status=="in_progress" or .status=="waiting" or .status=="pending")] | length'
+          }
+
+          failure_streak() {
+            wf="$1"
+            gh run list --repo "$REPO" --workflow "$wf" --limit 5 \
+              --json status,conclusion \
+              --jq '.[] | select(.status=="completed") | (.conclusion // "")' \
+            | python3 -c '
+          import sys
+          bad={"failure","cancelled","timed_out","action_required","startup_failure"}
+          n=0
+          for line in sys.stdin:
+              c=line.strip()
+              if c in bad:
+                  n += 1
+              else:
+                  break
+          print(n)
+          '
           }
 
           trigger_if_idle() {
             wf="$1"
             label="$2"
-            active=$(gh run list --repo "$REPO" --workflow "$wf" --limit 20 \
-              --json status \
-              --jq '[.[] | select(.status=="queued" or .status=="in_progress" or .status=="waiting" or .status=="pending")] | length')
+            active=$(active_runs "$wf")
             echo "${label}_ACTIVE_RUNS=$active"
             if [ "$active" -eq 0 ]; then
               echo "${label}=TRIGGER_REFRESH"
@@ -112,22 +129,22 @@ jobs:
           d=json.load(open(sys.argv[1]))
           now=datetime.now(timezone.utc)
           def age(entry):
-              ts=(entry or {}).get('captured_at')
+              ts=(entry or {}).get("captured_at")
               if not ts:
                   return 999999
-              dt=datetime.fromisoformat(str(ts).replace('Z','+00:00'))
+              dt=datetime.fromisoformat(str(ts).replace("Z","+00:00"))
               if dt.tzinfo is None:
                   dt=dt.replace(tzinfo=timezone.utc)
               return max(0,int((now-dt.astimezone(timezone.utc)).total_seconds()))
-          f=d.get('freshness') or {}
-          m=f.get('match_odds') or {}
-          o=f.get('outrights') or {}
+          f=d.get("freshness") or {}
+          m=f.get("match_odds") or {}
+          o=f.get("outrights") or {}
           print(
-              d.get('schema_version',0),
+              d.get("schema_version",0),
               age(m),
               age(o),
-              float(o.get('capture_ratio') or 0),
-              d.get('generated_at_utc') or 'unknown'
+              float(o.get("capture_ratio") or 0),
+              d.get("generated_at_utc") or "unknown"
           )
           PY
           )"
@@ -138,25 +155,24 @@ jobs:
           echo "OUTRIGHT_CAPTURE_RATIO=$ratio"
           echo "HEALTH_GENERATED_AT=$generated_at"
 
-          live_state=$(workflow_state m88-live-ai-publish.yml)
-          outright_state=$(workflow_state m88-outrights-all-publish.yml)
-          echo "LIVE_WORKFLOW=$live_state"
-          echo "OUTRIGHT_WORKFLOW=$outright_state"
-
-          live_status=${live_state%%|*}
-          rest=${live_state#*|}; live_conclusion=${rest%%|*}
-          out_status=${outright_state%%|*}
-          rest=${outright_state#*|}; out_conclusion=${rest%%|*}
-
-          # Self-heal cadence misses before they reach the hard stale threshold.
-          # Match target 300s + 120s scheduling/runtime slack.
+          # Recover cadence misses first. A single failed workflow run is not
+          # itself a production incident while the published dataset is usable.
           if [ "$match_age" -gt 420 ]; then
             trigger_if_idle m88-live-ai-publish.yml MATCH
           fi
-          # Outright target 900s + 300s scheduling/runtime slack.
           if [ "$outright_age" -gt 1200 ]; then
             trigger_if_idle m88-outrights-all-publish.yml OUTRIGHT
           fi
+
+          match_active=$(active_runs m88-live-ai-publish.yml)
+          outright_active=$(active_runs m88-outrights-all-publish.yml)
+          match_failures=$(failure_streak m88-live-ai-publish.yml)
+          outright_failures=$(failure_streak m88-outrights-all-publish.yml)
+
+          echo "MATCH_ACTIVE_RUNS=$match_active"
+          echo "OUTRIGHT_ACTIVE_RUNS=$outright_active"
+          echo "MATCH_FAILURE_STREAK=$match_failures"
+          echo "OUTRIGHT_FAILURE_STREAK=$outright_failures"
 
           reasons=()
           [ "$schema" = '3' ] || reasons+=("schema_version=${schema}, expected 3")
@@ -167,12 +183,13 @@ jobs:
           raise SystemExit(0 if float(sys.argv[1]) >= .90 else 1)
           PY
 
-          case "$live_conclusion" in
-            failure|cancelled|timed_out|action_required|startup_failure) reasons+=("latest match publisher conclusion=${live_conclusion}") ;;
-          esac
-          case "$out_conclusion" in
-            failure|cancelled|timed_out|action_required|startup_failure) reasons+=("latest outright publisher conclusion=${out_conclusion}") ;;
-          esac
+          # Escalate workflow failures only when repeated and no recovery is active.
+          if [ "$match_failures" -ge 2 ] && [ "$match_age" -gt 420 ] && [ "$match_active" -eq 0 ]; then
+            reasons+=("match publisher failed ${match_failures} consecutive completed runs")
+          fi
+          if [ "$outright_failures" -ge 2 ] && [ "$outright_age" -gt 1200 ] && [ "$outright_active" -eq 0 ]; then
+            reasons+=("outright publisher failed ${outright_failures} consecutive completed runs")
+          fi
 
           if [ "${#reasons[@]}" -gt 0 ]; then
             joined=$(IFS='; '; echo "${reasons[*]}")
@@ -181,9 +198,6 @@ jobs:
             exit 0
           fi
 
-          # Healthy snapshot: move a lightweight recovery branch to the exact
-          # m88-ai-data commit. No file copying is required; if a future run
-          # fails, this branch simply stays on the last known-good commit.
           good_sha=$(gh api "repos/${REPO}/branches/m88-ai-data" --jq '.commit.sha')
           if gh api "repos/${REPO}/git/ref/heads/m88-ai-last-good" >/dev/null 2>&1; then
             gh api --method PATCH "repos/${REPO}/git/refs/heads/m88-ai-last-good" \
