@@ -1,4 +1,4 @@
-name: Runner7 M88 Freshness Watchdog
+name: Runner7 M88 Pipeline Guardian
 
 on:
   workflow_dispatch:
@@ -7,19 +7,20 @@ on:
     - cron: '4-59/5 * * * *'
 
 permissions:
-  contents: read
+  contents: write
   actions: write
+  issues: write
 
 concurrency:
-  group: runner7-m88-freshness-watchdog-v1
+  group: runner7-m88-pipeline-guardian-v2
   cancel-in-progress: true
 
 jobs:
-  check:
+  guard:
     runs-on: ubuntu-latest
-    timeout-minutes: 2
+    timeout-minutes: 3
     steps:
-      - name: Check Match Odds freshness and recover missed cadence
+      - name: Guard freshness, recover missed runs, preserve last-good
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
@@ -27,55 +28,166 @@ jobs:
         run: |
           set -euo pipefail
 
-          URL="https://raw.githubusercontent.com/${REPO}/m88-ai-data/matches/index.json"
+          ALERT_TITLE='[M88 AUTO] Odds pipeline degraded'
+          HEALTH_URL="https://raw.githubusercontent.com/${REPO}/m88-ai-data/health.json"
           tmp=$(mktemp)
+
+          find_alert_issue() {
+            gh issue list --repo "$REPO" --state open --limit 100 \
+              --json number,title \
+              --jq '.[] | select(.title=="[M88 AUTO] Odds pipeline degraded") | .number' \
+              | head -n1
+          }
+
+          open_alert() {
+            reason="$1"
+            issue=$(find_alert_issue || true)
+            if [ -n "$issue" ]; then
+              echo "ALERT_ALREADY_OPEN=$issue"
+              return 0
+            fi
+            body=$(cat <<EOF
+          Automatic Runner7 guardian alert.
+
+          Reason: ${reason}
+
+          Current canonical data remains on \`m88-ai-data\`. The recovery branch \`m88-ai-last-good\` is intentionally NOT advanced while the pipeline is unhealthy, so consumers can fall back to the last snapshot that passed the guardian gates.
+
+          Checked at: $(date -u +'%Y-%m-%dT%H:%M:%SZ')
+          EOF
+          )
+            gh issue create --repo "$REPO" --title "$ALERT_TITLE" --body "$body" >/dev/null
+            echo 'ALERT=OPENED'
+          }
+
+          close_alert_if_recovered() {
+            issue=$(find_alert_issue || true)
+            if [ -z "$issue" ]; then
+              return 0
+            fi
+            gh issue comment "$issue" --repo "$REPO" \
+              --body "Automatic recovery confirmed at $(date -u +'%Y-%m-%dT%H:%M:%SZ'). Freshness/schema/coverage gates are healthy again; closing alert." >/dev/null
+            gh issue close "$issue" --repo "$REPO" >/dev/null
+            echo "ALERT=CLOSED_RECOVERED:$issue"
+          }
+
+          workflow_state() {
+            wf="$1"
+            gh run list --repo "$REPO" --workflow "$wf" --limit 1 \
+              --json status,conclusion,databaseId,createdAt \
+              --jq 'if length==0 then "missing|missing|0|" else .[0] | [.status, (.conclusion // ""), (.databaseId|tostring), .createdAt] | join("|") end'
+          }
+
+          trigger_if_idle() {
+            wf="$1"
+            label="$2"
+            active=$(gh run list --repo "$REPO" --workflow "$wf" --limit 20 \
+              --json status \
+              --jq '[.[] | select(.status=="queued" or .status=="in_progress" or .status=="waiting" or .status=="pending")] | length')
+            echo "${label}_ACTIVE_RUNS=$active"
+            if [ "$active" -eq 0 ]; then
+              echo "${label}=TRIGGER_REFRESH"
+              gh workflow run "$wf" --repo "$REPO"
+            else
+              echo "${label}=REFRESH_ALREADY_ACTIVE"
+            fi
+          }
 
           if ! curl -fsS --connect-timeout 8 --max-time 15 \
             -H 'Cache-Control: no-cache' \
-            "${URL}?ts=$(date +%s)" -o "$tmp"; then
-            echo "WATCHDOG=INDEX_FETCH_FAILED"
+            "${HEALTH_URL}?ts=$(date +%s)" -o "$tmp"; then
+            open_alert 'health.json fetch failed'
+            trigger_if_idle m88-live-ai-publish.yml MATCH
             exit 0
           fi
 
-          age=$(python3 - "$tmp" <<'PY'
+          read -r schema match_age outright_age ratio generated_at <<<"$(python3 - "$tmp" <<'PY'
           import json,sys
           from datetime import datetime, timezone
 
           d=json.load(open(sys.argv[1]))
-          ts=d.get("source_captured_at") or ((d.get("freshness") or {}).get("captured_at"))
-          if not ts:
-              print(999999)
-              raise SystemExit
-          dt=datetime.fromisoformat(str(ts).replace("Z","+00:00"))
-          if dt.tzinfo is None:
-              dt=dt.replace(tzinfo=timezone.utc)
-          print(max(0,int((datetime.now(timezone.utc)-dt.astimezone(timezone.utc)).total_seconds())))
+          now=datetime.now(timezone.utc)
+          def age(entry):
+              ts=(entry or {}).get('captured_at')
+              if not ts:
+                  return 999999
+              dt=datetime.fromisoformat(str(ts).replace('Z','+00:00'))
+              if dt.tzinfo is None:
+                  dt=dt.replace(tzinfo=timezone.utc)
+              return max(0,int((now-dt.astimezone(timezone.utc)).total_seconds()))
+          f=d.get('freshness') or {}
+          m=f.get('match_odds') or {}
+          o=f.get('outrights') or {}
+          print(
+              d.get('schema_version',0),
+              age(m),
+              age(o),
+              float(o.get('capture_ratio') or 0),
+              d.get('generated_at_utc') or 'unknown'
+          )
           PY
-          )
+          )"
 
-          echo "MATCH_AGE_SECONDS=$age"
+          echo "SCHEMA_VERSION=$schema"
+          echo "MATCH_AGE_SECONDS=$match_age"
+          echo "OUTRIGHT_AGE_SECONDS=$outright_age"
+          echo "OUTRIGHT_CAPTURE_RATIO=$ratio"
+          echo "HEALTH_GENERATED_AT=$generated_at"
 
-          # Primary target is 300s. Allow 120s scheduling/runtime slack.
-          if [ "$age" -le 420 ]; then
-            echo "WATCHDOG=FRESH"
+          live_state=$(workflow_state m88-live-ai-publish.yml)
+          outright_state=$(workflow_state m88-outrights-all-publish.yml)
+          echo "LIVE_WORKFLOW=$live_state"
+          echo "OUTRIGHT_WORKFLOW=$outright_state"
+
+          live_status=${live_state%%|*}
+          rest=${live_state#*|}; live_conclusion=${rest%%|*}
+          out_status=${outright_state%%|*}
+          rest=${outright_state#*|}; out_conclusion=${rest%%|*}
+
+          # Self-heal cadence misses before they reach the hard stale threshold.
+          # Match target 300s + 120s scheduling/runtime slack.
+          if [ "$match_age" -gt 420 ]; then
+            trigger_if_idle m88-live-ai-publish.yml MATCH
+          fi
+          # Outright target 900s + 300s scheduling/runtime slack.
+          if [ "$outright_age" -gt 1200 ]; then
+            trigger_if_idle m88-outrights-all-publish.yml OUTRIGHT
+          fi
+
+          reasons=()
+          [ "$schema" = '3' ] || reasons+=("schema_version=${schema}, expected 3")
+          [ "$match_age" -le 1200 ] || reasons+=("match odds stale: ${match_age}s > 1200s")
+          [ "$outright_age" -le 2700 ] || reasons+=("outrights stale: ${outright_age}s > 2700s")
+          python3 - "$ratio" <<'PY' || reasons+=("outright capture ratio ${ratio} < 0.90")
+          import sys
+          raise SystemExit(0 if float(sys.argv[1]) >= .90 else 1)
+          PY
+
+          case "$live_conclusion" in
+            failure|cancelled|timed_out|action_required|startup_failure) reasons+=("latest match publisher conclusion=${live_conclusion}") ;;
+          esac
+          case "$out_conclusion" in
+            failure|cancelled|timed_out|action_required|startup_failure) reasons+=("latest outright publisher conclusion=${out_conclusion}") ;;
+          esac
+
+          if [ "${#reasons[@]}" -gt 0 ]; then
+            joined=$(IFS='; '; echo "${reasons[*]}")
+            echo "GUARDIAN=DEGRADED: $joined"
+            open_alert "$joined"
             exit 0
           fi
 
-          # Do not pile another run on top of an already queued/running publisher.
-          active=$(
-            gh run list \
-              --repo "$REPO" \
-              --workflow m88-live-ai-publish.yml \
-              --limit 20 \
-              --json status \
-              --jq '[.[] | select(.status=="queued" or .status=="in_progress" or .status=="waiting" or .status=="pending")] | length'
-          )
-          echo "ACTIVE_PUBLISH_RUNS=$active"
-
-          if [ "$active" -gt 0 ]; then
-            echo "WATCHDOG=STALE_BUT_PUBLISH_ACTIVE"
-            exit 0
+          # Healthy snapshot: move a lightweight recovery branch to the exact
+          # m88-ai-data commit. No file copying is required; if a future run
+          # fails, this branch simply stays on the last known-good commit.
+          good_sha=$(gh api "repos/${REPO}/branches/m88-ai-data" --jq '.commit.sha')
+          if gh api "repos/${REPO}/git/ref/heads/m88-ai-last-good" >/dev/null 2>&1; then
+            gh api --method PATCH "repos/${REPO}/git/refs/heads/m88-ai-last-good" \
+              -f sha="$good_sha" -F force=true >/dev/null
+          else
+            gh api --method POST "repos/${REPO}/git/refs" \
+              -f ref='refs/heads/m88-ai-last-good' -f sha="$good_sha" >/dev/null
           fi
-
-          echo "WATCHDOG=TRIGGER_REFRESH"
-          gh workflow run m88-live-ai-publish.yml --repo "$REPO"
+          echo "LAST_GOOD_SHA=$good_sha"
+          echo 'GUARDIAN=HEALTHY'
+          close_alert_if_recovered
