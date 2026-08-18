@@ -1,4 +1,4 @@
-# trigger: 2026-08-18 runner7 migration
+# Runner7 migration bootstrap. PR trigger is used because connector-created pushes do not reliably start Actions.
 name: Bootstrap M88 Pipeline From Runner3
 
 on:
@@ -7,6 +7,10 @@ on:
     branches: [main]
     paths:
       - '.github/workflows/bootstrap-m88-from-runner3.yml'
+  pull_request:
+    types: [opened, synchronize, reopened]
+    paths:
+      - '.runner7-bootstrap-trigger'
 
 permissions:
   contents: write
@@ -19,6 +23,7 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          ref: ${{ github.event_name == 'pull_request' && github.head_ref || github.ref }}
 
       - name: Copy current M88 capture core into Runner7
         shell: bash
@@ -35,6 +40,19 @@ jobs:
           python3 - <<'PY'
           from pathlib import Path
 
+          def add_pr_trigger(path, trigger):
+              p=Path(path)
+              s=p.read_text(encoding='utf-8')
+              block=("  pull_request:\n"
+                     "    types: [opened, synchronize, reopened]\n"
+                     "    paths:\n"
+                     f"      - '{trigger}'\n")
+              if f"- '{trigger}'" not in s:
+                  anchor="  workflow_dispatch:\n"
+                  if anchor not in s: raise SystemExit(f'{path}: workflow_dispatch anchor missing')
+                  s=s.replace(anchor, anchor+block, 1)
+              p.write_text(s,encoding='utf-8')
+
           p=Path('.github/workflows/m88-live-publish.yml')
           s=p.read_text(encoding='utf-8')
           needle="      - 'render_m88_full.py'\n"
@@ -42,6 +60,7 @@ jobs:
               if needle not in s: raise SystemExit('live workflow path anchor missing')
               s=s.replace(needle, needle+"      - '.m88-live-trigger'\n", 1)
           p.write_text(s,encoding='utf-8')
+          add_pr_trigger(p, '.m88-live-trigger')
 
           p=Path('.github/workflows/m88-outrights-all-publish.yml')
           s=p.read_text(encoding='utf-8')
@@ -50,11 +69,12 @@ jobs:
               if needle not in s: raise SystemExit('outright workflow path anchor missing')
               s=s.replace(needle, needle+"      - '.m88-outrights-trigger'\n", 1)
           p.write_text(s,encoding='utf-8')
+          add_pr_trigger(p, '.m88-outrights-trigger')
           PY
 
           python3 -m py_compile m88_full_odds.py render_m88_full.py build_m88_ai_database.py build_m88_ai_shards.py
 
-      - name: Commit migrated core
+      - name: Commit migrated core to the current branch
         shell: bash
         run: |
           set -euo pipefail
@@ -67,5 +87,6 @@ jobs:
             echo 'M88 core already current'
           else
             git commit -m 'Migrate M88 capture pipeline to runner-7'
-            git push origin HEAD:main
+            TARGET_BRANCH="${GITHUB_HEAD_REF:-main}"
+            git push origin HEAD:"$TARGET_BRANCH"
           fi
