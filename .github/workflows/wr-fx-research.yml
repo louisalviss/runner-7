@@ -22,6 +22,11 @@ jobs:
   backtest:
     runs-on: ubuntu-latest
     timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      max-parallel: 11
+      matrix:
+        symbol: [EURUSD, GBPUSD, USDJPY, AUDUSD, USDCAD, USDCHF, NZDUSD, EURJPY, GBPJPY, EURGBP, XAUUSD]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -33,7 +38,13 @@ jobs:
           set -euo pipefail
           git clone --depth 1 https://github.com/TghMonster/ForexDatasetDownloader.git /tmp/marketdl
           pip install -q -e /tmp/marketdl
-      - name: Run WR FX/Gold 2022-2026
+      - name: Limit run to matrix symbol
+        shell: bash
+        run: |
+          set -euo pipefail
+          sed -i 's/^SYMBOLS = .*/SYMBOLS = ["${{ matrix.symbol }}"]/' research/wr_fx_backtest.py
+          grep '^SYMBOLS' research/wr_fx_backtest.py
+      - name: Run WR ${{ matrix.symbol }} 2022-2026
         shell: bash
         run: |
           set -euo pipefail
@@ -41,6 +52,6 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: wr-fx-results
+          name: wr-fx-${{ matrix.symbol }}
           path: /tmp/wr-fx-out
           retention-days: 7
