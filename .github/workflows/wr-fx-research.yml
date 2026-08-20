@@ -24,18 +24,37 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
-      - name: Probe public M5 files
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Probe HistData M1
         shell: bash
         run: |
           set -euo pipefail
-          mkdir -p /tmp/fx
-          for s in EURUSD GBPUSD AUDUSD NZDUSD; do
-            u="https://raw.githubusercontent.com/jaxontn/historical-Data/main/${s}_M5.csv"
-            echo "=== $s ==="
-            curl -fL --retry 3 "$u" -o "/tmp/fx/${s}.csv"
-            echo "BYTES=$(wc -c < /tmp/fx/${s}.csv) LINES=$(wc -l < /tmp/fx/${s}.csv)"
-            echo "HEAD"
-            head -n 3 "/tmp/fx/${s}.csv"
-            echo "TAIL"
-            tail -n 3 "/tmp/fx/${s}.csv"
-          done
+          git clone --depth 1 https://github.com/TghMonster/ForexDatasetDownloader.git /tmp/marketdl
+          pip install -q -e /tmp/marketdl
+          python - <<'PY'
+          from pathlib import Path
+          import zipfile
+          from marketdl.providers.histdata import HistDataProvider
+          out=Path('/tmp/hist')
+          p=HistDataProvider(platform='ASCII', timeout=45, max_retries=2)
+          for sym,year,month in [('EURUSD',2025,1),('USDJPY',2025,1),('XAUUSD',2025,1)]:
+              print(f'=== {sym} {year}-{month:02d} ===')
+              zpath=p.download_month(sym,year,month,timeframe='M1',output_dir=out)
+              print('ZIP',zpath,zpath.stat().st_size)
+              with zipfile.ZipFile(zpath) as z:
+                  print('FILES',[(i.filename,i.file_size) for i in z.infolist()])
+                  name=z.namelist()[0]
+                  with z.open(name) as f:
+                      first=[]; last=[]; n=0
+                      for raw in f:
+                          line=raw.decode(errors='replace').strip()
+                          if not line: continue
+                          n+=1
+                          if len(first)<2: first.append(line)
+                          last=(last+[line])[-2:]
+                      print('ROWS',n)
+                      print('FIRST',first)
+                      print('LAST',last)
+          PY
