@@ -1,0 +1,51 @@
+{
+  "schema_version": 3,
+  "operator": "M88",
+  "generated_at_utc": "2026-08-21T16:49:38.438657Z",
+  "generated_at_vn": "2026-08-21T23:49:38.438657+07:00",
+  "status": "fresh",
+  "status_at_build": "fresh",
+  "freshness": {
+    "match_odds": {
+      "status": "fresh",
+      "status_at_build": "fresh",
+      "captured_at": "2026-08-21T16:49:35.092034+00:00",
+      "age_seconds": 3,
+      "age_seconds_semantics": "deprecated_build_time_only",
+      "age_at_build_seconds": 3,
+      "target_refresh_seconds": 300,
+      "target_refresh_at": "2026-08-21T16:54:35.092034Z",
+      "stale_after_seconds": 1200,
+      "stale_after_at": "2026-08-21T17:09:35.092034Z",
+      "consumer_rule": "Recompute current age as now_utc - captured_at. Do not treat age_at_build_seconds or status_at_build as live values.",
+      "source": "direct M88/MSports guest feed"
+    },
+    "outrights": {
+      "status": "fresh",
+      "status_at_build": "fresh",
+      "captured_at": "2026-08-21T16:20:52.284514Z",
+      "age_seconds": 1726,
+      "age_seconds_semantics": "deprecated_build_time_only",
+      "age_at_build_seconds": 1726,
+      "target_refresh_seconds": 900,
+      "target_refresh_at": "2026-08-21T16:35:52.284514Z",
+      "stale_after_seconds": 2700,
+      "stale_after_at": "2026-08-21T17:05:52.284514Z",
+      "consumer_rule": "Recompute current age as now_utc - captured_at. Do not treat age_at_build_seconds or status_at_build as live values.",
+      "source": "native M88 -> SABA Outright board",
+      "capture_ratio": 0.9863
+    }
+  },
+  "index": {
+    "match_scopes": {
+      "live": 148,
+      "today": 378,
+      "early": 461
+    },
+    "match_count": 987,
+    "match_selection_count": 27314,
+    "outright_market_count": 72,
+    "outright_failed_market_count": 1,
+    "outright_competition_count": 37
+  }
+}
