@@ -1,0 +1,153 @@
+name: Temporary EDM DSH Render Host
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/tmp-edm-dsh-render.yml'
+      - 'tmp-edm-dsh-trigger.txt'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  render:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      DSH_VERSION: '0.1.0-rc.7'
+      PLAYWRIGHT_MCP_VERSION: '0.0.78'
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '24'
+
+      - name: Clone production pipeline
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch edm-top10-dsh-render https://github.com/louisalviss/runner-6.git work
+          test -s work/scripts/render-edm-top10-dsh.py
+          test -s work/scripts/run-edm-top10-dsh-ci.sh
+
+      - name: Install runtime and media tools
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq ffmpeg python3-opencv python3-numpy python3-pil fonts-dejavu-core
+          cd work
+          bash scripts/setup-dsh-media-tools.sh
+          bash scripts/setup-dsh-runtime.sh
+          bash scripts/setup-dsh-playwright.sh .
+
+      - name: Configure DSH
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$OPENROUTER_API_KEY" || { echo 'OPENROUTER_API_KEY missing on runner-7'; exit 3; }
+          echo "DSH_HOME=$RUNNER_TEMP/dsh-home" >> "$GITHUB_ENV"
+          mkdir -p "$RUNNER_TEMP/dsh-home"
+          cat > "$RUNNER_TEMP/dsh-home/settings.yaml" <<'YAML'
+          llm-pi-ai:
+            providers:
+              openrouter-v4:
+                displayName: OpenRouter DeepSeek V4 Pro
+                apiKeyEnv: OPENROUTER_API_KEY
+                api: openai-completions
+                baseURL: https://openrouter.ai/api/v1
+                compat:
+                  thinkingFormat: openrouter
+                models:
+                  - id: deepseek/deepseek-v4-pro
+                    name: DeepSeek V4 Pro
+                    contextWindow: 1000000
+                    maxTokens: 12000
+                    input: [text]
+          agent-default-model:
+            provider: openrouter-v4
+            model: deepseek/deepseek-v4-pro
+          YAML
+          chmod 600 "$RUNNER_TEMP/dsh-home/settings.yaml"
+          echo "DSH_BIN=$HOME/.cache/runner6-dsh-runtime/rc7-pwmcp078-pnpm/node_modules/.bin/dsh" >> "$GITHUB_ENV"
+
+      - name: DSH media selection
+        env:
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd work
+          mkdir -p dsh-handoff/edm-top10-dsh
+          TASK=$(cat <<'EOF'
+          You are the media-acquisition specialist for a vertical short-form video. Your job ends at source selection/handoff; another compositor will do ALL editing, crop/reframe, typography, timing, transitions, audio sync/mix, render and QC.
+
+          Video concept: Top 10 Nostalgic EDM Songs — 2010s, about 59.5 seconds, countdown 10 to 1. Fixed ranking:
+          10 Tsunami — DVBBS & Borgeous
+          9 Heroes (We Could Be) — Alesso ft. Tove Lo
+          8 The Nights — Avicii
+          7 Summer — Calvin Harris
+          6 Titanium — David Guetta ft. Sia
+          5 Animals — Martin Garrix
+          4 Don't You Worry Child — Swedish House Mafia
+          3 Clarity — Zedd ft. Foxes
+          2 Wake Me Up — Avicii
+          1 Levels — Avicii
+
+          Use the Playwright browser and current public internet to select ONE strong downloadable public A/V source for EACH song. The source can be a music video, live/festival performance, fan upload, TikTok, YouTube or another public page. Official vs non-official status is NOT a selection priority. Do not optimize for licensing/public-domain/stock status. Select only on: correct song, recognizable audio, strong/interesting visuals, usable quality, vertical-crop resilience, and a good iconic 5-7 second moment. Do not choose based merely on download convenience.
+
+          For each track, verify that the page is actually about the correct song and provide a recommended start_sec pointing to a recognizable/strong section. Prefer sources under 10 minutes and public without login when possible. Avoid compilations containing many unrelated songs unless the exact target segment can be identified confidently.
+
+          Write exactly one JSON file to dsh-handoff/edm-top10-dsh/dsh-selection.json with top-level keys tracks and rationale. tracks must contain exactly 10 objects with rank, song, artist, selected_source. selected_source must contain title, url, start_sec, why_selected. rank must be integer 1..10 and start_sec a non-negative number. Do not render or edit video. Finish with EDM_DSH_SELECTION_READY.
+          EOF
+          )
+          set +e
+          timeout --signal=TERM --kill-after=10s 420s "$DSH_BIN" --profile headless "$TASK"
+          CODE=$?
+          set -e
+          test -s dsh-handoff/edm-top10-dsh/dsh-selection.json
+          python3 - <<'PY'
+          import json
+          p=json.load(open('dsh-handoff/edm-top10-dsh/dsh-selection.json'))
+          assert sorted(int(x['rank']) for x in p['tracks'])==list(range(1,11))
+          assert len(p['tracks'])==10
+          for x in p['tracks']:
+              s=x['selected_source']; assert s['url'].startswith('http') and s['title'] and float(s['start_sec'])>=0
+          print(json.dumps(p,ensure_ascii=False,indent=2))
+          PY
+          if [ "$CODE" != 0 ] && [ "$CODE" != 124 ]; then exit "$CODE"; fi
+
+      - name: Acquire handoff and render final
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd work
+          bash scripts/run-edm-top10-dsh-ci.sh
+          ROOT=dsh-handoff/edm-top10-dsh/final
+          ffmpeg -nostdin -v error -i "$ROOT/edm_top10_nostalgia.mp4" -f null -
+          python3 - <<'PY'
+          import json
+          q=json.load(open('dsh-handoff/edm-top10-dsh/final/qa.json'))
+          assert q['pass'] and q['resolution']==[1080,1920] and q['video_codec']=='h264' and q['audio_codec']=='aac' and q['sample_rate']==48000
+          assert 59.0 <= q['duration'] <= 60.0
+          print(json.dumps(q,indent=2))
+          PY
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: edm-top10-dsh-runner7-${{ github.run_id }}
+          path: |
+            work/dsh-handoff/edm-top10-dsh/dsh-selection.json
+            work/dsh-handoff/edm-top10-dsh/final/edm_top10_nostalgia.mp4
+            work/dsh-handoff/edm-top10-dsh/final/qa-contact.jpg
+            work/dsh-handoff/edm-top10-dsh/final/qa.json
+            work/dsh-handoff/edm-top10-dsh/final/timeline.json
+            work/dsh-handoff/edm-top10-dsh/final/SOURCE_MANIFEST.json
+          retention-days: 3
+          if-no-files-found: error
