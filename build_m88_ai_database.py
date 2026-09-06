@@ -74,8 +74,16 @@ def main():
     out_failures = outs.get("failures") or []
     source_text = " ".join(str(matches.get(k, "")) for k in ("source", "source_mode", "source_provider", "source_provenance"))
     exact_match = matches.get("exact_operator_odds") is True and "m88" in source_text.lower() and len(match_list) >= 50
-    exact_out = outs.get("exact_operator_odds") is True and len(out_list) >= 40
-    ratio = float((outs.get("coverage") or {}).get("capture_ratio") or 0)
+    coverage = outs.get("coverage") or {}
+    discovery_floor = int(coverage.get("discovery_floor") or 40)
+    discovered_markets = int(coverage.get("discovered_markets") or len(out_list) + len(out_failures))
+    exact_out = (
+        outs.get("exact_operator_odds") is True
+        and discovery_floor >= 1
+        and discovered_markets >= discovery_floor
+        and len(out_list) >= discovery_floor
+    )
+    ratio = float(coverage.get("capture_ratio") or 0)
 
     if not exact_match:
         raise SystemExit("Direct M88 match feed validation failed")
@@ -137,6 +145,8 @@ def main():
         source="native M88 -> SABA Outright board",
         status=out_status,
         capture_ratio=ratio,
+        discovery_floor=discovery_floor,
+        discovered_markets=discovered_markets,
     )
 
     db = {
