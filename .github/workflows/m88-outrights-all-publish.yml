@@ -171,6 +171,7 @@ jobs:
             echo "CAPTURE_ATTEMPT=$n"
             if sudo ip netns exec vpnns timeout 360s runuser -u runner -- \
               env HOME=/home/runner WORKSPACE="$GITHUB_WORKSPACE" \
+              M88_OUTRIGHT_MIN_DISCOVERY="$M88_OUTRIGHT_MIN_DISCOVERY" \
               python3 "$GITHUB_WORKSPACE/m88_outrights_capture.py" \
               > >(tee "evidence/capture-attempt-${n}.log") \
               2> >(tee -a "evidence/capture-attempt-${n}.log" >&2); then
