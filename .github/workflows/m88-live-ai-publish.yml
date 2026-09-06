@@ -214,19 +214,6 @@ jobs:
           set -euo pipefail
           AUTH_HEADER=$(git config --local --get http.https://github.com/.extraheader || true)
 
-          rm -rf /tmp/m88-live-pub
-          git init -q /tmp/m88-live-pub
-          git -C /tmp/m88-live-pub config user.name 'github-actions[bot]'
-          git -C /tmp/m88-live-pub config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git -C /tmp/m88-live-pub remote add origin "https://github.com/${GITHUB_REPOSITORY}.git"
-          [ -z "$AUTH_HEADER" ] || git -C /tmp/m88-live-pub config http.https://github.com/.extraheader "$AUTH_HEADER"
-          git -C /tmp/m88-live-pub checkout --orphan m88-live-data >/dev/null 2>&1
-          cp publish/data.json publish/odds.csv /tmp/m88-live-pub/
-          printf '%s\n' 'M88 exact match odds. Runner7 combined live+AI publisher.' > /tmp/m88-live-pub/README.md
-          git -C /tmp/m88-live-pub add .
-          git -C /tmp/m88-live-pub commit -q -m "M88 sports odds $(date -u +'%Y-%m-%d %H:%M:%S UTC')"
-          git -C /tmp/m88-live-pub push -q --force origin HEAD:m88-live-data
-
           cp publish/data.json ai-input/match-odds.json
           gh release download m88-outrights-all \
             --repo "$GITHUB_REPOSITORY" \
@@ -250,7 +237,7 @@ jobs:
           assert db.get('schema_version')==3
           assert db.get('operator')=='M88'
           assert int((db.get('index') or {}).get('match_count') or 0) >= 50
-          assert int((db.get('index') or {}).get('outright_market_count') or 0) >= 25
+          assert int((((db.get('freshness') or {}).get('outrights') or {}).get('discovered_markets') or 0)) >= 35
           assert float((((db.get('freshness') or {}).get('outrights') or {}).get('capture_ratio') or 0)) >= .90
           nav=json.loads((root/'index.json').read_text())
           oi=json.loads((root/nav['outrights']['index']).read_text())
@@ -272,6 +259,24 @@ jobs:
           assert sample is not None, 'no priced Outright selection in generated shards'
           print(json.dumps({'smoke':'PASS',**sample},ensure_ascii=False))
           PY
+
+          if [[ "$GITHUB_REF" != "refs/heads/main" ]]; then
+            echo 'RUNNER7_M88_BRANCH_ACCEPTANCE=PASS_NO_PUBLISH'
+            exit 0
+          fi
+
+          rm -rf /tmp/m88-live-pub
+          git init -q /tmp/m88-live-pub
+          git -C /tmp/m88-live-pub config user.name 'github-actions[bot]'
+          git -C /tmp/m88-live-pub config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git -C /tmp/m88-live-pub remote add origin "https://github.com/${GITHUB_REPOSITORY}.git"
+          [ -z "$AUTH_HEADER" ] || git -C /tmp/m88-live-pub config http.https://github.com/.extraheader "$AUTH_HEADER"
+          git -C /tmp/m88-live-pub checkout --orphan m88-live-data >/dev/null 2>&1
+          cp publish/data.json publish/odds.csv /tmp/m88-live-pub/
+          printf '%s\n' 'M88 exact match odds. Runner7 combined live+AI publisher.' > /tmp/m88-live-pub/README.md
+          git -C /tmp/m88-live-pub add .
+          git -C /tmp/m88-live-pub commit -q -m "M88 sports odds $(date -u +'%Y-%m-%d %H:%M:%S UTC')"
+          git -C /tmp/m88-live-pub push -q --force origin HEAD:m88-live-data
 
           rm -rf /tmp/m88-ai-pub
           git init -q /tmp/m88-ai-pub
