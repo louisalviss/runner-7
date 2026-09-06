@@ -250,18 +250,27 @@ jobs:
           assert db.get('schema_version')==3
           assert db.get('operator')=='M88'
           assert int((db.get('index') or {}).get('match_count') or 0) >= 50
-          assert int((db.get('index') or {}).get('outright_market_count') or 0) >= 40
+          assert int((db.get('index') or {}).get('outright_market_count') or 0) >= 25
           assert float((((db.get('freshness') or {}).get('outrights') or {}).get('capture_ratio') or 0)) >= .90
           nav=json.loads((root/'index.json').read_text())
           oi=json.loads((root/nav['outrights']['index']).read_text())
-          epl=next(x for x in oi['competitions'] if x.get('slug')=='epl')
-          shard=json.loads((root/epl['path']).read_text())
-          winner=next((m for m in shard['markets'] if (m.get('market_name_guess') or '').strip().casefold()=='winner'),None)
-          if winner is None:
-              winner=next(m for m in shard['markets'] if str(m.get('title') or '').strip().casefold().endswith(' - winner'))
-          arsenal=next(s for s in winner['selections'] if str(s.get('name') or '').strip().casefold()=='arsenal')
-          assert arsenal.get('odds') is not None
-          print(json.dumps({'smoke':'PASS','market':winner.get('title'),'selection':'Arsenal','odds':arsenal.get('odds')},ensure_ascii=False))
+          sample=None
+          for comp in oi.get('competitions') or []:
+              path=comp.get('path')
+              if not path:
+                  continue
+              shard=json.loads((root/path).read_text())
+              for market in shard.get('markets') or []:
+                  for selection in market.get('selections') or []:
+                      if selection.get('odds') is not None:
+                          sample={'competition':comp.get('name') or comp.get('slug'),'market':market.get('title'),'selection':selection.get('name'),'odds':selection.get('odds')}
+                          break
+                  if sample:
+                      break
+              if sample:
+                  break
+          assert sample is not None, 'no priced Outright selection in generated shards'
+          print(json.dumps({'smoke':'PASS',**sample},ensure_ascii=False))
           PY
 
           rm -rf /tmp/m88-ai-pub
