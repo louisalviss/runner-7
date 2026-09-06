@@ -229,9 +229,14 @@ def main():
             if str(key).isdigit() and isinstance(title, str) and title.strip():
                 targets.append((int(key), title.strip()))
         targets.sort(key=lambda x: x[0])
-        if len(targets) < 40:
+        # The live Outright board size is seasonal and can legitimately move below 40.
+        # Fail only on a clearly truncated discovery surface; downstream coverage still
+        # requires >=90% before absence can be treated as reliable.
+        discovery_floor = 25
+        if len(targets) < discovery_floor:
             raise RuntimeError(
-                f"Unsafe Outright discovery count={len(targets)} showall={len(showall)} route={route}"
+                f"Unsafe Outright discovery count={len(targets)} floor={discovery_floor} "
+                f"showall={len(showall)} route={route}"
             )
 
         markets = []
@@ -365,6 +370,7 @@ def main():
             "status": "fresh" if coverage >= 0.90 else "partial",
             "coverage": {
                 "showall_responses": len(showall),
+                "discovery_floor": discovery_floor,
                 "discovered_markets": len(targets),
                 "captured_markets": len(markets),
                 "failed_markets": len(failures),
