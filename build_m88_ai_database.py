@@ -6,6 +6,8 @@ import json
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
+from m88_safety import outright_quality
+
 
 def parse_dt(value):
     if not value:
@@ -74,13 +76,17 @@ def main():
     out_failures = outs.get("failures") or []
     source_text = " ".join(str(matches.get(k, "")) for k in ("source", "source_mode", "source_provider", "source_provenance"))
     exact_match = matches.get("exact_operator_odds") is True and "m88" in source_text.lower() and len(match_list) >= 50
-    exact_out = outs.get("exact_operator_odds") is True and len(out_list) >= 40
-    ratio = float((outs.get("coverage") or {}).get("capture_ratio") or 0)
+    outright = outright_quality(outs)
+    ratio = outright["capture_ratio"]
 
     if not exact_match:
         raise SystemExit("Direct M88 match feed validation failed")
-    if not exact_out:
-        raise SystemExit("M88 Outright validation failed")
+    if not outright["ok"]:
+        raise SystemExit(
+            "M88 Outright validation failed: "
+            f"discovered={outright['discovered']} captured={outright['captured']} "
+            f"required={outright['required_captured']} ratio={outright['capture_ratio']:.4f}"
+        )
 
     scopes = {}
     leagues = set()
@@ -167,6 +173,8 @@ def main():
             "match_count": len(match_list),
             "match_selection_count": selection_count,
             "outright_market_count": len(out_list),
+            "outright_discovered_market_count": outright["discovered"],
+            "outright_required_captured_count": outright["required_captured"],
             "outright_failed_market_count": len(out_failures),
             "outright_competitions": dict(sorted(competitions.items(), key=lambda x: x[0].casefold())),
             "outright_titles": outright_index,

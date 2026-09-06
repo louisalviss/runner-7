@@ -11,8 +11,11 @@ from urllib.parse import parse_qs, urlparse
 
 from playwright.sync_api import sync_playwright
 
+from m88_safety import configured_min_discovery
+
 OUT = Path(os.environ.get("WORKSPACE", ".")) / "evidence"
 OUT.mkdir(parents=True, exist_ok=True)
+
 
 
 def pframe(page):
@@ -229,9 +232,11 @@ def main():
             if str(key).isdigit() and isinstance(title, str) and title.strip():
                 targets.append((int(key), title.strip()))
         targets.sort(key=lambda x: x[0])
-        if len(targets) < 40:
+        min_discovery = configured_min_discovery(os.environ.get("M88_OUTRIGHT_MIN_DISCOVERY"))
+        if len(targets) < min_discovery:
             raise RuntimeError(
-                f"Unsafe Outright discovery count={len(targets)} showall={len(showall)} route={route}"
+                f"Unsafe Outright discovery count={len(targets)} min={min_discovery} "
+                f"showall={len(showall)} route={route}"
             )
 
         markets = []

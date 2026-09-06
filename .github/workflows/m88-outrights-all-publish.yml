@@ -9,6 +9,7 @@ on:
     paths:
       - '.github/workflows/m88-outrights-all-publish.yml'
       - 'm88_outrights_capture.py'
+      - 'm88_safety.py'
 
 permissions:
   contents: write
@@ -118,6 +119,35 @@ jobs:
           done </tmp/relays.tsv
           test "$selected" = 1
 
+      - name: Derive adaptive Outright discovery floor from last-good snapshot
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf /tmp/m88-outright-baseline
+          mkdir -p /tmp/m88-outright-baseline
+          if gh release download m88-outrights-all \
+            --repo "$GITHUB_REPOSITORY" \
+            --pattern 'm88-outrights-all.json' \
+            --dir /tmp/m88-outright-baseline \
+            --clobber; then
+            python3 - <<'PY'
+          import json, os
+          from m88_safety import adaptive_discovery_floor
+          p='/tmp/m88-outright-baseline/m88-outrights-all.json'
+          d=json.load(open(p))
+          previous=int((d.get('coverage') or {}).get('discovered_markets') or 0)
+          floor=adaptive_discovery_floor(previous, 0.80)
+          with open(os.environ['GITHUB_ENV'],'a',encoding='utf-8') as f:
+              f.write(f'M88_OUTRIGHT_MIN_DISCOVERY={floor}\n')
+          print(f'OUTRIGHT_DISCOVERY_BASELINE previous={previous} floor={floor} ratio=0.80')
+          PY
+          else
+            echo 'OUTRIGHT_DISCOVERY_BASELINE unavailable; fail-closed floor=40'
+            echo 'M88_OUTRIGHT_MIN_DISCOVERY=40' >> "$GITHUB_ENV"
+          fi
+
       - name: Capture SABA Outright with retry and relay failover
         shell: bash
         run: |
@@ -202,6 +232,7 @@ jobs:
           capture_once 2
 
       - name: Publish last-good full Outright snapshot
+        if: github.ref == 'refs/heads/main'
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
