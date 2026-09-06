@@ -250,7 +250,7 @@ jobs:
           assert db.get('schema_version')==3
           assert db.get('operator')=='M88'
           assert int((db.get('index') or {}).get('match_count') or 0) >= 50
-          assert int((db.get('index') or {}).get('outright_market_count') or 0) >= 25
+          assert int((((db.get('freshness') or {}).get('outrights') or {}).get('discovered_markets') or 0)) >= 35
           assert float((((db.get('freshness') or {}).get('outrights') or {}).get('capture_ratio') or 0)) >= .90
           nav=json.loads((root/'index.json').read_text())
           oi=json.loads((root/nav['outrights']['index']).read_text())

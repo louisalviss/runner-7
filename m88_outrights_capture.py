@@ -232,7 +232,7 @@ def main():
         # The live Outright board size is seasonal and can legitimately move below 40.
         # Fail only on a clearly truncated discovery surface; downstream coverage still
         # requires >=90% before absence can be treated as reliable.
-        discovery_floor = 25
+        discovery_floor = 35
         if len(targets) < discovery_floor:
             raise RuntimeError(
                 f"Unsafe Outright discovery count={len(targets)} floor={discovery_floor} "

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
@@ -29,6 +30,30 @@ def iso_plus_seconds(value, seconds):
     if dt is None:
         return None
     return (dt + timedelta(seconds=seconds)).isoformat().replace("+00:00", "Z")
+
+
+def outright_quality(outs):
+    markets = outs.get("markets") or []
+    failures = outs.get("failures") or []
+    coverage = outs.get("coverage") or {}
+    discovery_floor = max(35, int(coverage.get("discovery_floor") or 35))
+    discovered = int(coverage.get("discovered_markets") or len(markets) + len(failures))
+    ratio = float(coverage.get("capture_ratio") or 0)
+    required_captured = math.ceil(discovered * 0.90) if discovered else discovery_floor
+    return {
+        "ok": (
+            outs.get("exact_operator_odds") is True
+            and discovered >= discovery_floor
+            and ratio >= 0.90
+            and len(markets) >= required_captured
+        ),
+        "discovery_floor": discovery_floor,
+        "discovered": discovered,
+        "captured": len(markets),
+        "failed": len(failures),
+        "capture_ratio": ratio,
+        "required_captured": required_captured,
+    }
 
 
 def freshness_entry(*, now, captured_at, target_refresh_seconds, stale_after_seconds, source, status, **extra):
@@ -74,16 +99,12 @@ def main():
     out_failures = outs.get("failures") or []
     source_text = " ".join(str(matches.get(k, "")) for k in ("source", "source_mode", "source_provider", "source_provenance"))
     exact_match = matches.get("exact_operator_odds") is True and "m88" in source_text.lower() and len(match_list) >= 50
-    coverage = outs.get("coverage") or {}
-    discovery_floor = int(coverage.get("discovery_floor") or 40)
-    discovered_markets = int(coverage.get("discovered_markets") or len(out_list) + len(out_failures))
-    exact_out = (
-        outs.get("exact_operator_odds") is True
-        and discovery_floor >= 1
-        and discovered_markets >= discovery_floor
-        and len(out_list) >= discovery_floor
-    )
-    ratio = float(coverage.get("capture_ratio") or 0)
+    outright = outright_quality(outs)
+    discovery_floor = outright["discovery_floor"]
+    discovered_markets = outright["discovered"]
+    ratio = outright["capture_ratio"]
+    required_captured = outright["required_captured"]
+    exact_out = outright["ok"]
 
     if not exact_match:
         raise SystemExit("Direct M88 match feed validation failed")
@@ -147,6 +168,7 @@ def main():
         capture_ratio=ratio,
         discovery_floor=discovery_floor,
         discovered_markets=discovered_markets,
+        required_captured_markets=required_captured,
     )
 
     db = {
