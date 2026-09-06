@@ -1,0 +1,31 @@
+name: WR FX HistData Archive Probe
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - '.github/workflows/wr-fx-histdata-archive-probe.yml'
+permissions:
+  contents: read
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Compare archive/current pages
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import requests,re
+          s=requests.Session(); s.headers['User-Agent']='Mozilla/5.0'
+          for y,m in [(2024,1),(2025,1)]:
+            u=f'https://www.histdata.com/download-free-forex-historical-data/?/ascii/1-minute-bar-quotes/EURUSD/{y}/{m}'
+            r=s.get(u,timeout=30)
+            print('===',y,m,'status',r.status_code,'len',len(r.text),'url',r.url)
+            print('TITLE',re.findall(r'<title>(.*?)</title>',r.text,re.I|re.S)[:1])
+            print('TK',re.findall(r'name=["\']tk["\'][^>]*value=["\']([^"\']+)',r.text,re.I)[:3])
+            for pat in [r'get\.php',r'datemonth',r'2024',r'2025',r'download']:
+              hits=[x.strip()[:500] for x in r.text.splitlines() if re.search(pat,x,re.I)]
+              print('PAT',pat,'HITS',hits[:10])
+          PY
